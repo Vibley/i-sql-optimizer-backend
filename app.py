@@ -10,7 +10,7 @@ ALLOW_ORIGIN = os.getenv("ALLOW_ORIGIN", "*")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # ---------------- App ----------------
-app = FastAPI(title="AI SQL Optimizer Backend", version="1.1.0")
+app = FastAPI(title="AI SQL Optimizer Backend", version="1.1.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -124,4 +124,81 @@ def analyze(req: AnalyzeRequest):
             f"Return safe, actionable tuning advice. Use <YourTable> placeholders; never invent schema names."
         )
         plan = (req.plan_xml or "")[:20000]  # keep request bounded
-        user_msg = f"""SQL (formatted):
+
+        # Build prompt without triple-quoted f-strings to avoid syntax pitfalls
+        user_msg = (
+            "SQL (formatted):\n"
+            "```\n"
+            f"{sql_fmt}\n"
+            "```\n\n"
+            "Context:\n"
+            f"{req.context or 'n/a'}\n\n"
+            "Execution plan XML (optional, truncated):\n"
+            f"{plan if plan else 'n/a'}\n"
+        )
+
+        json_instructions = (
+            "Return a JSON object with keys: "
+            "summary (string), findings (array of strings), rewrite_sql (string), "
+            "index_recommendations (array of strings), risks (array of strings), "
+            "test_steps (array of strings). No extra keys or text."
+        )
+
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.2,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+                {"role": "user", "content": json_instructions},
+            ],
+        )
+
+        llm = json.loads(resp.choices[0].message.content)
+
+        # Merge static & LLM results (dedupe)
+        def dedupe(seq):
+            seen, out = set(), []
+            for s in seq or []:
+                if s not in seen:
+                    seen.add(s); out.append(s)
+            return out
+
+        findings = dedupe((base_findings or []) + (llm.get("findings") or []))
+        indexes = dedupe((base_indexes or []) + (llm.get("index_recommendations") or []))
+        risks = dedupe((base_risks or []) + (llm.get("risks") or []))
+        rewrite = llm.get("rewrite_sql") or base_rewrite
+        summary = llm.get("summary") or "Analysis completed."
+        steps = llm.get("test_steps") or [
+            "Capture current plan & metrics (duration, CPU, reads).",
+            "Apply one change at a time (index or rewrite).",
+            "Compare estimated vs actual plans; validate row estimates.",
+            "Benchmark on prod-like data; check regressions."
+        ]
+
+        return AnalyzeResponse(
+            summary=summary,
+            findings=findings or ["No obvious issues found."],
+            rewrite_sql=rewrite,
+            index_recommendations=indexes,
+            risks=risks,
+            test_steps=steps,
+        )
+
+    except Exception as e:
+        # Fail-soft: return static analysis with reason
+        base_findings.append(f"AI enhancer unavailable: {e}")
+        return AnalyzeResponse(
+            summary="Static analysis completed (LLM call failed).",
+            findings=base_findings,
+            rewrite_sql=base_rewrite,
+            index_recommendations=base_indexes,
+            risks=base_risks,
+            test_steps=[
+                "Capture current plan & metrics (duration, CPU, reads).",
+                "Apply one change at a time (index or rewrite).",
+                "Compare estimated vs actual plans; validate row estimates.",
+                "Benchmark on prod-like data; check regressions."
+            ],
+        )
