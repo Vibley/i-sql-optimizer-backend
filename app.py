@@ -5,9 +5,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import sqlparse
 
-# --- hard-disable proxies to avoid SDK kwargs mismatch ---
+# --- Kill any proxy envs that could confuse the OpenAI SDK/httpx ---
 for k in ["HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy","OPENAI_PROXY"]:
     os.environ.pop(k, None)
+
+# (Optional) Log the OpenAI SDK version at startup so we can verify cache
+try:
+    import openai
+    import logging
+    logging.getLogger("uvicorn.error").info(f"OpenAI SDK version: {openai.__version__}")
+except Exception:
+    pass
+
 
 
 ALLOW_ORIGIN = os.getenv("ALLOW_ORIGIN", "*")
@@ -107,7 +116,12 @@ def analyze(req: AnalyzeRequest):
 
     try:
         from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY)
+import httpx
+
+# trust_env=False means httpx will NOT read any *_PROXY env vars
+http_client = httpx.Client(trust_env=False, timeout=30.0)
+client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
+
 
         system_msg = (
             f"You are a veteran {req.dbms} performance engineer. "
