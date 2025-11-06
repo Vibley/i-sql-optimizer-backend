@@ -76,13 +76,21 @@ def static_rules(sql: str):
 
     # Guess composite index keys from equality predicates like t.Col = @p
     m = re.findall(r"\b([A-Z_][A-Z0-9_\.]+)\s*=\s*[@:\w'\-]+", sql_compact)
-    if m:
-        cols = []
-        for col in m:
-            cols.append(col.split(".")[-1])
-        cols = list(dict.fromkeys(cols))[:3]
-        if cols:
-            index_recs.append(f"CREATE INDEX IX_Suggested ON <YourTable> ({', '.join(cols)});")
+   if m:
+    cols = [col.split(".")[-1] for col in m]
+    cols = list(dict.fromkeys(cols))[:3]
+
+    # 🧠 Try to extract table name from query
+    tbl_match = re.search(r"\bFROM\s+([A-Z0-9_\.\[\]]+)", sql_compact)
+    if not tbl_match:
+        tbl_match = re.search(r"\bJOIN\s+([A-Z0-9_\.\[\]]+)", sql_compact)
+    table_name = tbl_match.group(1) if tbl_match else "<YourTable>"
+
+    if cols:
+        index_recs.append(
+            f"CREATE INDEX IX_{cols[0]}_Suggested ON {table_name} ({', '.join(cols)});"
+        )
+
 
     return findings, ("\n".join(rewrites) if rewrites else None), index_recs, risks
 
