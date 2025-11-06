@@ -9,7 +9,7 @@ import sqlparse
 for k in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "OPENAI_PROXY"]:
     os.environ.pop(k, None)
 
-# Optional: log OpenAI SDK version at startup
+# Optional: log OpenAI SDK version at startup (helps verify cache/pin)
 try:
     import openai  # noqa: F401
     import logging
@@ -20,7 +20,7 @@ except Exception:
 ALLOW_ORIGIN = os.getenv("ALLOW_ORIGIN", "*")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-app = FastAPI(title="AI SQL Optimizer Backend", version="1.1.3")
+app = FastAPI(title="AI SQL Optimizer Backend", version="1.1.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -50,48 +50,55 @@ class AnalyzeResponse(BaseModel):
 def static_rules(sql: str):
     findings, rewrites, index_recs, risks = [], [], [], []
     sql_norm = sql.strip()
+
+    # Compact upper-case copy for pattern checks
     sql_compact = re.sub(r"\s+", " ", sql_norm, flags=re.MULTILINE).upper()
 
+    # SELECT *
     if re.search(r"\bSELECT\s+\*\b", sql_compact):
         findings.append("Avoid SELECT *. Project only required columns.")
         risks.append("Extra I/O and wider rows reduce buffer cache efficiency.")
 
+    # Leading wildcard LIKE
     if re.search(r"LIKE\s+['\"]%[^'\"]+['\"]", sql_compact):
         findings.append("Leading wildcard LIKE prevents index seeks.")
         rewrites.append("-- Consider full-text index or trigram/contains search.")
         risks.append("Full scans on large tables can be expensive.")
 
+    # Non-sargable function on column
     if re.search(r"WHERE\s+.*\b(YEAR|MONTH|DAY|DATEADD|DATEDIFF|SUBSTRING|CAST|CONVERT)\s*\(", sql_compact):
         findings.append("Non-sargable predicate (function on column) blocks index seeks.")
         rewrites.append("-- Rewrite to range predicate on the raw column when possible.")
 
+    # OR conditions
     if re.search(r"\bWHERE\b.*\bOR\b", sql_compact):
         findings.append("OR conditions may reduce index usage; consider UNION ALL or indexed computed columns.")
 
+    # ORDER BY without JOIN
     if "ORDER BY" in sql_compact and "JOIN" not in sql_compact:
         findings.append("ORDER BY detected; ensure index supports ORDER BY key(s).")
 
+    # JOIN without WHERE
     if "WHERE" not in sql_compact and "JOIN" in sql_compact:
         findings.append("JOIN without WHERE may explode rows; verify join predicates and filters.")
 
     # Guess composite index keys from equality predicates like t.Col = @p
     m = re.findall(r"\b([A-Z_][A-Z0-9_\.]+)\s*=\s*[@:\w'\-]+", sql_compact)
     if m:
-        cols = [col.split(".")[-1] for col in m]
-        cols = list(dict.fromkeys(cols))[:3]
+        # keep only the column name part and lowercase
+        cols = [col.split(".")[-1].lower() for col in m]
+        cols = list(dict.fromkeys(cols))[:3]  # de-dupe, keep first 3
 
-        # 🧠 Try to extract table name from query (FROM first, then JOIN)
+        # Try to extract table name from query (FROM first, then JOIN), then lowercase
         tbl_match = re.search(r"\bFROM\s+([A-Z0-9_\.\[\]]+)", sql_compact)
         if not tbl_match:
             tbl_match = re.search(r"\bJOIN\s+([A-Z0-9_\.\[\]]+)", sql_compact)
-       
-table_name = tbl_match.group(1) if tbl_match else "<YourTable>"
+        table_name = tbl_match.group(1).lower() if tbl_match else "<yourtable>"
 
-if cols:
-    index_recs.append(
-        f"CREATE INDEX IX_{cols[0]}_Suggested ON {table_name} ({', '.join(cols)});"
-    )
-  
+        if cols:
+            index_recs.append(
+                f"create index ix_{cols[0]}_suggested on {table_name} ({', '.join(cols)});"
+            )
 
     return findings, ("\n".join(rewrites) if rewrites else None), index_recs, risks
 
@@ -111,7 +118,7 @@ def analyze(req: AnalyzeRequest):
 
     base_findings, base_rewrite, base_indexes, base_risks = static_rules(sql_fmt)
 
-    # No key -> static only
+    # If no API key, return static analysis only
     if not OPENAI_API_KEY:
         return AnalyzeResponse(
             summary="Static analysis completed (OpenAI not configured).",
@@ -127,11 +134,12 @@ def analyze(req: AnalyzeRequest):
             ],
         )
 
-    # OpenAI call with httpx client that ignores *_PROXY env vars
+    # With OpenAI: Chat Completions (JSON mode)
     try:
         import httpx
         from openai import OpenAI
 
+        # httpx client that ignores any *_PROXY env vars
         http_client = httpx.Client(trust_env=False, timeout=30.0)
         client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
 
