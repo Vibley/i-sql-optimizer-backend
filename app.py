@@ -1,4 +1,4 @@
-import os, json, re
+import os, json, re, datetime
 from typing import List, Optional
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,7 +20,7 @@ except Exception:
 ALLOW_ORIGIN = os.getenv("ALLOW_ORIGIN", "*")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-app = FastAPI(title="AI SQL Optimizer Backend", version="1.2.2")
+app = FastAPI(title="AI SQL Optimizer Backend", version="1.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -46,6 +46,22 @@ class AnalyzeResponse(BaseModel):
     risks: List[str] = Field(default_factory=list)
     test_steps: List[str] = Field(default_factory=list)
 
+# ---------- Date helpers ----------
+def _iso_next_day(d: str) -> str:
+    """Return ISO date string of the day after d (d='YYYY-MM-DD')."""
+    y, m, day = map(int, d.split("-"))
+    dt = datetime.date(y, m, day) + datetime.timedelta(days=1)
+    return dt.strftime("%Y-%m-%d")
+
+def _month_range(yyyy: int, mm: int):
+    """Return ('YYYY-MM-01', 'YYYY-MM-next-01') as strings."""
+    start = datetime.date(yyyy, mm, 1)
+    if mm == 12:
+        nxt = datetime.date(yyyy + 1, 1, 1)
+    else:
+        nxt = datetime.date(yyyy, mm + 1, 1)
+    return (start.strftime("%Y-%m-%d"), nxt.strftime("%Y-%m-%d"))
+
 # ---------- Static rules + simple rewrites ----------
 def static_rules(sql: str):
     """
@@ -55,7 +71,7 @@ def static_rules(sql: str):
       index_recs: List[str]
       risks: List[str]
     """
-    findings, rewrites, index_recs, risks = [], [], [], []
+    findings, guidance_lines, index_recs, risks = [], [], [], []
     sql_norm = sql.strip()
     sql_compact = re.sub(r"\s+", " ", sql_norm, flags=re.MULTILINE).upper()
 
@@ -63,18 +79,18 @@ def static_rules(sql: str):
     if re.search(r"\bSELECT\s+\*\b", sql_compact):
         findings.append("Avoid SELECT *. Project only required columns.")
         risks.append("Extra I/O and wider rows reduce buffer cache efficiency.")
-        rewrites.append("-- Replace SELECT * with only required columns.")
+        guidance_lines.append("-- Replace SELECT * with only required columns.")
 
     # Leading wildcard LIKE
     if re.search(r"LIKE\s+['\"]%[^'\"]+['\"]", sql_compact):
         findings.append("Leading wildcard LIKE prevents index seeks.")
-        rewrites.append("-- Consider full-text index (CONTAINS) or trigram search.")
+        guidance_lines.append("-- Consider full-text index (CONTAINS) or trigram search.")
         risks.append("Full scans on large tables can be expensive.")
 
     # Non-sargable function on column
-    if re.search(r"WHERE\s+.*\b(YEAR|MONTH|DAY|DATEADD|DATEDIFF|SUBSTRING|CAST|CONVERT)\s*\(", sql_compact):
-        findings.append("Non-sargable predicate (function on column) blocks index seeks.")
-        rewrites.append("-- Rewrite to a range predicate on the raw column when possible.")
+    if re.search(r"WHERE\s+.*\b(YEAR|MONTH|DAY|DATE|DATEADD|DATEDIFF|SUBSTRING|CAST|CONVERT)\s*\(", sql_compact) or re.search(r"::\s*DATE\b", sql_norm, flags=re.IGNORECASE):
+        findings.append("Non-sargable predicate (function/cast on column) can block index seeks.")
+        guidance_lines.append("-- Prefer sargable range predicates over functions/casts on columns.")
 
     # OR conditions
     if re.search(r"\bWHERE\b.*\bOR\b", sql_compact):
@@ -88,31 +104,87 @@ def static_rules(sql: str):
     if "WHERE" not in sql_compact and "JOIN" in sql_compact:
         findings.append("JOIN without WHERE may explode rows; verify join predicates and filters.")
 
-    # ---------- Simple static rewrite candidates ----------
-    base_rewrite_sql = None
+    # ---------- Concrete rewrites (apply-in-place where safe) ----------
+    working = sql_norm
+    concrete_changes = 0
 
-    # Heuristic: WHERE YEAR(col) = 2024  -->  col >= '2024-01-01' AND col < '2025-01-01'
-    year_eq = re.search(
-        r"\bYEAR\s*\(\s*(?P<col>[A-Za-z0-9_\.\[\]]+)\s*\)\s*=\s*(?P<yyyy>20\d{2}|19\d{2})",
-        sql_norm,
-        flags=re.IGNORECASE,
-    )
-    if year_eq:
-        col = year_eq.group("col")
-        yyyy = int(year_eq.group("yyyy"))
-        start = f"'{yyyy:04d}-01-01'"
-        next_year = f"'{(yyyy+1):04d}-01-01'"
-        range_pred = f"{col} >= {start} AND {col} < {next_year}"
-        base_rewrite_sql = re.sub(
+    # YEAR(col) = YYYY  --> date range for that year
+    for m in re.finditer(r"\bYEAR\s*\(\s*(?P<col>[A-Za-z0-9_\.\[\]]+)\s*\)\s*=\s*(?P<yyyy>19\d{2}|20\d{2})", working, flags=re.IGNORECASE):
+        col = m.group("col")
+        yyyy = int(m.group("yyyy"))
+        start = f"{yyyy:04d}-01-01"
+        end   = f"{(yyyy+1):04d}-01-01"
+        rng = f"{col} >= '{start}' AND {col} < '{end}'"
+        working = re.sub(
             r"\bYEAR\s*\(\s*"+re.escape(col)+r"\s*\)\s*=\s*"+str(yyyy),
-            range_pred,
-            sql_norm,
+            rng,
+            working,
             count=1,
             flags=re.IGNORECASE,
         )
+        concrete_changes += 1
         if "Non-sargable predicate" not in " ".join(findings):
             findings.append("Non-sargable predicate (function on column) blocks index seeks.")
-        rewrites.append("-- Replaced YEAR(col)=YYYY with a sargable date range.")
+
+    # DATE(col) = 'YYYY-MM-DD'  --> day range
+    for m in re.finditer(r"\bDATE\s*\(\s*(?P<col>[A-Za-z0-9_\.\[\]]+)\s*\)\s*=\s*'(?P<d>\d{4}-\d{2}-\d{2})'", working, flags=re.IGNORECASE):
+        col = m.group("col")
+        d   = m.group("d")
+        d2  = _iso_next_day(d)
+        rng = f"{col} >= '{d}' AND {col} < '{d2}'"
+        working = re.sub(
+            r"\bDATE\s*\(\s*"+re.escape(col)+r"\s*\)\s*=\s*'"+re.escape(d)+r"'",
+            rng,
+            working,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        concrete_changes += 1
+
+    # CAST(col AS DATE) = 'YYYY-MM-DD'  --> day range
+    for m in re.finditer(r"\bCAST\s*\(\s*(?P<col>[A-Za-z0-9_\.\[\]]+)\s+AS\s+DATE\s*\)\s*=\s*'(?P<d>\d{4}-\d{2}-\d{2})'", working, flags=re.IGNORECASE):
+        col = m.group("col")
+        d   = m.group("d")
+        d2  = _iso_next_day(d)
+        rng = f"{col} >= '{d}' AND {col} < '{d2}'"
+        working = re.sub(
+            r"\bCAST\s*\(\s*"+re.escape(col)+r"\s+AS\s+DATE\s*\)\s*=\s*'"+re.escape(d)+r"'",
+            rng,
+            working,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        concrete_changes += 1
+
+    # Postgres: col::DATE = 'YYYY-MM-DD'  --> day range
+    for m in re.finditer(r"\b(?P<col>[A-Za-z0-9_\.\[\]]+)\s*::\s*DATE\s*=\s*'(?P<d>\d{4}-\d{2}-\d{2})'", working, flags=re.IGNORECASE):
+        col = m.group("col")
+        d   = m.group("d")
+        d2  = _iso_next_day(d)
+        rng = f"{col} >= '{d}' AND {col} < '{d2}'"
+        working = re.sub(
+            r"\b"+re.escape(col)+r"\s*::\s*DATE\s*=\s*'"+re.escape(d)+r"'",
+            rng,
+            working,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        concrete_changes += 1
+
+    # MONTH(col)=M + YEAR(col)=YYYY  --> provide exact month range as guidance
+    # (We do not rewrite in-place because the two predicates may appear in any order/spacing.)
+    mon = re.search(r"\bMONTH\s*\(\s*(?P<c1>[A-Za-z0-9_\.\[\]]+)\s*\)\s*=\s*(?P<mm>1[0-2]|0?[1-9])", sql_norm, flags=re.IGNORECASE)
+    yr  = re.search(r"\bYEAR\s*\(\s*(?P<c2>[A-Za-z0-9_\.\[\]]+)\s*\)\s*=\s*(?P<yyyy>19\d{2}|20\d{2})", sql_norm, flags=re.IGNORECASE)
+    if mon and yr:
+        c1 = mon.group("c1"); c2 = yr.group("c2")
+        mm = int(mon.group("mm")); yyyy = int(yr.group("yyyy"))
+        if c1.lower() == c2.lower():
+            start, end = _month_range(yyyy, mm)
+            guidance_lines.append(
+                f"-- Replace MONTH({c1})={mm} AND YEAR({c1})={yyyy} with range:\n"
+                f"-- {c1} >= '{start}' AND {c1} < '{end}'"
+            )
+            findings.append("Non-sargable month/year predicates detected; prefer a single range on the date column.")
 
     # ---------- Index key guess based on equality predicates ----------
     m = re.findall(r"\b([A-Z_][A-Z0-9_\.]+)\s*=\s*[@:\w'\-]+", sql_compact)
@@ -131,8 +203,12 @@ def static_rules(sql: str):
                 f"create index ix_{cols[0]}_suggested on {table_name} ({', '.join(cols)});"
             )
 
-    guidance = "\n".join(rewrites) if rewrites else None
-    rewrite_out = base_rewrite_sql or guidance  # prefer concrete rewrite, fallback to comments
+    # Choose output rewrite: concrete if we changed anything; else guidance lines (if any)
+    if concrete_changes > 0:
+        rewrite_out = working
+    else:
+        rewrite_out = "\n".join(guidance_lines) if guidance_lines else None
+
     return findings, rewrite_out, index_recs, risks
 
 # ---------- Health ----------
@@ -183,7 +259,6 @@ def analyze(req: AnalyzeRequest):
         )
         plan = (req.plan_xml or "")[:20000]  # truncate to keep request bounded
 
-        # Build prompt (avoid triple-quoted f-strings)
         user_msg = (
             "SQL (formatted):\n```\n"
             f"{sql_fmt}\n```\n\nContext:\n"
@@ -224,8 +299,7 @@ def analyze(req: AnalyzeRequest):
         # Strict guardrail to suppress echo rewrites
         def _canon_sql(s: str) -> str:
             s = (s or "")
-            # strip code fences like ```sql ... ``` or ``` ...
-            s = re.sub(r"```(?:sql)?", "", s, flags=re.IGNORECASE)
+            s = re.sub(r"```(?:sql)?", "", s, flags=re.IGNORECASE)  # strip ```sql fences
             s = s.replace("`", "")
             s = s.strip()
             if s.endswith(";"):
