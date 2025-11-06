@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 import sqlparse
 
 # --- Remove any proxy envs that could confuse OpenAI/httpx ---
-for k in ["HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy","OPENAI_PROXY"]:
+for k in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "OPENAI_PROXY"]:
     os.environ.pop(k, None)
 
 # Optional: log OpenAI SDK version at startup
@@ -20,7 +20,7 @@ except Exception:
 ALLOW_ORIGIN = os.getenv("ALLOW_ORIGIN", "*")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-app = FastAPI(title="AI SQL Optimizer Backend", version="1.1.2")
+app = FastAPI(title="AI SQL Optimizer Backend", version="1.1.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -76,21 +76,20 @@ def static_rules(sql: str):
 
     # Guess composite index keys from equality predicates like t.Col = @p
     m = re.findall(r"\b([A-Z_][A-Z0-9_\.]+)\s*=\s*[@:\w'\-]+", sql_compact)
-   if m:
-    cols = [col.split(".")[-1] for col in m]
-    cols = list(dict.fromkeys(cols))[:3]
+    if m:
+        cols = [col.split(".")[-1] for col in m]
+        cols = list(dict.fromkeys(cols))[:3]
 
-    # 🧠 Try to extract table name from query
-    tbl_match = re.search(r"\bFROM\s+([A-Z0-9_\.\[\]]+)", sql_compact)
-    if not tbl_match:
-        tbl_match = re.search(r"\bJOIN\s+([A-Z0-9_\.\[\]]+)", sql_compact)
-    table_name = tbl_match.group(1) if tbl_match else "<YourTable>"
+        # 🧠 Try to extract table name from query (FROM first, then JOIN)
+        tbl_match = re.search(r"\bFROM\s+([A-Z0-9_\.\[\]]+)", sql_compact)
+        if not tbl_match:
+            tbl_match = re.search(r"\bJOIN\s+([A-Z0-9_\.\[\]]+)", sql_compact)
+        table_name = tbl_match.group(1) if tbl_match else "<YourTable>"
 
-    if cols:
-        index_recs.append(
-            f"CREATE INDEX IX_{cols[0]}_Suggested ON {table_name} ({', '.join(cols)});"
-        )
-
+        if cols:
+            index_recs.append(
+                f"CREATE INDEX IX_{cols[0]}_Suggested ON {table_name} ({', '.join(cols)});"
+            )
 
     return findings, ("\n".join(rewrites) if rewrites else None), index_recs, risks
 
