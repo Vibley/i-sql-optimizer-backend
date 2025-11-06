@@ -1,4 +1,5 @@
 import os, json, re, datetime, time
+from hashlib import md5
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,7 +18,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 REQUIRE_OPENAI = os.getenv("REQUIRE_OPENAI", "1") == "1"
 
 # -------- FastAPI setup --------
-app = FastAPI(title="AI SQL Optimizer Backend", version="1.7.0")
+app = FastAPI(title="AI SQL Optimizer Backend", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,7 +28,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -------- Logging middleware --------
+# -------- Global shared HTTP client & OpenAI client --------
+transport = httpx.HTTPTransport(retries=2, verify=True)
+timeout = httpx.Timeout(connect=10.0, read=120.0, write=120.0, pool=120.0)
+HTTP_CLIENT = httpx.Client(
+    transport=transport,
+    timeout=timeout,
+    limits=httpx.Limits(max_connections=20)
+)
+OPENAI_CLIENT = OpenAI(api_key=OPENAI_API_KEY, http_client=HTTP_CLIENT)
+
+# -------- In-memory cache --------
+CACHE = {}
+
+# -------- Middleware logging --------
 @app.middleware("http")
 async def log_time(request: Request, call_next):
     t0 = time.perf_counter()
@@ -53,15 +67,13 @@ class AnalyzeResponse(BaseModel):
     risks: List[str] = Field(default_factory=list)
     test_steps: List[str] = Field(default_factory=list)
 
-# -------- Helper functions --------
-def _iso_next_day(d: str) -> str:
-    y, m, day = map(int, d.split("-"))
-    return (datetime.date(y, m, day) + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-
-def _month_range(yyyy: int, mm: int):
-    start = datetime.date(yyyy, mm, 1)
-    nxt = datetime.date(yyyy + (1 if mm == 12 else 0), 1 if mm == 12 else mm + 1, 1)
-    return start.strftime("%Y-%m-%d"), nxt.strftime("%Y-%m-%d")
+# -------- Helpers --------
+def summarize_sql(sql_text: str, max_len: int = 3000) -> str:
+    """Compress or truncate long SQL to reduce LLM tokens."""
+    sql_clean = re.sub(r"\s+", " ", sql_text.strip())
+    if len(sql_clean) <= max_len:
+        return sql_clean
+    return sql_clean[:1500] + "\n-- ... truncated for brevity ...\n" + sql_clean[-1000:]
 
 def _canon_sql(s: str) -> str:
     s = (s or "")
@@ -71,57 +83,110 @@ def _canon_sql(s: str) -> str:
         s = s[:-1]
     return re.sub(r"\s+", " ", s).strip().lower()
 
-# -------- Static rules --------
-def static_rules(sql: str):
-    # (same as before)
-    findings, guidance_lines, index_recs, risks = [], [], [], []
-    sql_norm = sql.strip()
-    sql_compact = re.sub(r"\s+", " ", sql_norm, flags=re.MULTILINE).upper()
+def to_list(x):
+    if x is None: return []
+    if isinstance(x, list): return x
+    if isinstance(x, dict): return [str(v) for v in x.values()]
+    return [str(x)]
 
-    if re.search(r"\bSELECT\s+\*\b", sql_compact):
-        findings.append("Avoid SELECT *. Project only required columns.")
-        risks.append("Extra I/O and wider rows reduce buffer cache efficiency.")
-        guidance_lines.append("-- Replace SELECT * with only required columns.")
-
-    if re.search(r"LIKE\s+['\"]%[^'\"]+['\"]", sql_compact):
-        findings.append("Leading wildcard LIKE prevents index seeks.")
-        guidance_lines.append("-- Consider full-text index (CONTAINS) or trigram search.")
-        risks.append("Full scans on large tables can be expensive.")
-
-    if re.search(r"WHERE\s+.*\b(YEAR|MONTH|DAY|DATE|DATEADD|DATEDIFF|SUBSTRING|CAST|CONVERT)\s*\(", sql_compact) or \
-       re.search(r"::\s*DATE\b", sql_norm, flags=re.IGNORECASE):
-        findings.append("Non-sargable predicate (function/cast on column) can block index seeks.")
-        guidance_lines.append("-- Prefer sargable range predicates over functions/casts on columns.")
-
-    if re.search(r"\bWHERE\b.*\bOR\b", sql_compact):
-        findings.append("OR conditions may reduce index usage; consider UNION ALL or indexed computed columns.")
-
-    if "ORDER BY" in sql_compact and "JOIN" not in sql_compact:
-        findings.append("ORDER BY detected; ensure index supports ORDER BY key(s).")
-
-    if "WHERE" not in sql_compact and "JOIN" in sql_compact:
-        findings.append("JOIN without WHERE may explode rows; verify join predicates and filters.")
-
-    working = sql_norm
-    concrete_changes = 0
-
-    for m in re.finditer(r"\bYEAR\s*\(\s*(?P<col>[A-Za-z0-9_\.\[\]]+)\s*\)\s*=\s*(?P<yyyy>19\d{2}|20\d{2})", working, flags=re.IGNORECASE):
-        col, yyyy = m.group("col"), int(m.group("yyyy"))
-        start, end = f"{yyyy:04d}-01-01", f"{(yyyy+1):04d}-01-01"
-        rng = f"{col} >= '{start}' AND {col} < '{end}'"
-        working = re.sub(r"\bYEAR\s*\(\s*"+re.escape(col)+r"\s*\)\s*=\s*"+str(yyyy), rng, working, count=1, flags=re.IGNORECASE)
-        concrete_changes += 1
-
-    # (same rest of static_rules body as yours)
-    # ...
-    # Return results
-    rewrite_out = working if concrete_changes > 0 else ("\n".join(guidance_lines) if guidance_lines else None)
-    return findings, rewrite_out, index_recs, None, risks
+def dedupe(seq): 
+    return list(dict.fromkeys(seq or []))
 
 # -------- Health --------
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+# -------- Analyze (optimized + streaming) --------
+@app.post("/analyze")
+def analyze(req: AnalyzeRequest):
+    """Optimized streaming analyzer with caching & pre-summarization."""
+    if not OPENAI_API_KEY:
+        if REQUIRE_OPENAI:
+            raise HTTPException(status_code=503,
+                detail="OpenAI is required but OPENAI_API_KEY is missing.")
+        return StreamingResponse(iter(["data: {\"summary\":\"Static analysis only\"}\n\n"]),
+                                 media_type="text/event-stream")
+
+    sql = summarize_sql(req.sql_text or "")
+    key = md5((req.dbms + sql).encode()).hexdigest()
+    if key in CACHE:
+        print(f"[CACHE HIT] {key}")
+        return StreamingResponse(
+            iter(["event: done\ndata: " + json.dumps(CACHE[key]) + "\n\n"]),
+            media_type="text/event-stream"
+        )
+
+    def event_stream():
+        yield "event: message\ndata: {\"status\":\"starting\"}\n\n"
+
+        try:
+            # --- Quick mini model for first scan ---
+            quick = OPENAI_CLIENT.chat.completions.create(
+                model="gpt-4o-mini",
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": "List any obvious SQL anti-patterns (SELECT *, functions on columns, missing WHERE, etc.)"},
+                    {"role": "user", "content": sql}
+                ],
+                max_tokens=300
+            )
+            quick_findings = quick.choices[0].message.content
+            yield f"event: quick\ndata: {json.dumps({'quick_findings': quick_findings})}\n\n"
+
+            # --- Main deep analysis ---
+            system_msg = f"You are a veteran {req.dbms} performance engineer."
+            plan = (req.plan_xml or "")[:20000]
+            user_msg = (
+                f"Quick scan findings:\n{quick_findings}\n\n"
+                f"SQL:\n```\n{sql}\n```\n\nContext:\n{req.context or 'n/a'}\n\n"
+                f"Plan XML (optional):\n{plan or 'n/a'}\n"
+            )
+            json_instr = (
+                "Return a JSON object with exactly these keys: "
+                "summary (string), findings (array of strings), rewrite_sql (string), "
+                "index_recommendations (array of strings), risks (array of strings), "
+                "test_steps (array of strings). No nested objects or extra keys."
+            )
+
+            partial = ""
+            with OPENAI_CLIENT.chat.completions.with_streaming_response.create(
+                model="gpt-4o-mini",
+                temperature=0.2,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_msg},
+                    {"role": "user", "content": json_instr},
+                ],
+            ) as stream:
+                for event in stream:
+                    if event.type == "token":
+                        partial += event.token
+                        if len(partial) > 500 and partial.count("{") == partial.count("}"):
+                            yield f"event: chunk\ndata: {json.dumps({'partial': partial})}\n\n"
+
+            try:
+                llm = json.loads(partial)
+            except Exception:
+                llm = {"summary": "Model returned incomplete JSON.", "findings": [partial]}
+
+            result = {
+                "summary": str(llm.get("summary") or "LLM analysis completed."),
+                "findings": dedupe(to_list(llm.get("findings"))),
+                "rewrite_sql": llm.get("rewrite_sql") or "",
+                "index_recommendations": dedupe(to_list(llm.get("index_recommendations"))),
+                "risks": dedupe(to_list(llm.get("risks"))),
+                "test_steps": to_list(llm.get("test_steps")),
+            }
+
+            CACHE[key] = result
+            yield f"event: done\ndata: {json.dumps(result)}\n\n"
+
+        except Exception as e:
+            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 # -------- Quick OpenAI diag --------
 @app.get("/diag/openai")
@@ -129,116 +194,9 @@ def diag_openai():
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=503, detail="OPENAI_API_KEY is not set.")
     try:
-        timeout = httpx.Timeout(connect=10.0, read=20.0)
-        client = OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client(trust_env=False, timeout=timeout))
-        _ = client.chat.completions.create(model="gpt-4o-mini",
-                                           messages=[{"role":"user","content":"ping"}],
-                                           max_tokens=1)
+        _ = OPENAI_CLIENT.chat.completions.create(model="gpt-4o-mini",
+                                                  messages=[{"role":"user","content":"ping"}],
+                                                  max_tokens=1)
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"OpenAI check failed: {e}")
-
-# -------- Analyze (normal response) --------
-@app.post("/analyze", response_model=AnalyzeResponse)
-def analyze(req: AnalyzeRequest):
-    sql = req.sql_text or ""
-    try:
-        sql_fmt = sqlparse.format(sql, keyword_case="upper", reindent=True)
-    except Exception:
-        sql_fmt = sql
-
-    base_findings, base_rewrite, base_indexes, base_script, base_risks = static_rules(sql_fmt)
-
-    if not OPENAI_API_KEY:
-        if REQUIRE_OPENAI:
-            raise HTTPException(status_code=503,
-                detail="OpenAI is required but OPENAI_API_KEY is missing. Set it or disable REQUIRE_OPENAI.")
-        return AnalyzeResponse(
-            summary="Static analysis completed (OpenAI not configured).",
-            findings=base_findings or ["No obvious issues detected."],
-            rewrite_sql=base_rewrite or "No query rewrite suggestions were identified.",
-            index_recommendations=base_indexes,
-            index_script=base_script,
-            risks=base_risks,
-            test_steps=["Capture plan & metrics","Apply one change at a time","Compare plans","Benchmark regressions"]
-        )
-
-    try:
-        timeout = httpx.Timeout(connect=15.0, read=120.0, write=120.0, pool=120.0)
-        client = OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client(trust_env=False, timeout=timeout))
-
-        system_msg = f"You are a veteran {req.dbms} performance engineer."
-        plan = (req.plan_xml or "")[:20000]
-
-        user_msg = (
-            f"SQL:\n```\n{sql_fmt}\n```\n\nContext:\n{req.context or 'n/a'}\n\n"
-            f"Plan XML (optional):\n{plan or 'n/a'}\n"
-        )
-
-        json_instr = (
-            "Return a JSON object with keys: summary, findings, rewrite_sql, index_recommendations, risks, test_steps."
-        )
-
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0.2,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role":"system","content":system_msg},
-                {"role":"user","content":user_msg},
-                {"role":"user","content":json_instr},
-            ],
-        )
-
-        llm = json.loads(resp.choices[0].message.content)
-        def dedupe(seq): return list(dict.fromkeys(seq or []))
-
-        rewrite_raw = llm.get("rewrite_sql") or ""
-        same = _canon_sql(rewrite_raw) == _canon_sql(sql_fmt)
-        rewrite_final = None if same else (rewrite_raw or None)
-        if not rewrite_final:
-            rewrite_final = base_rewrite or "No query rewrite suggestions were identified."
-
-        return AnalyzeResponse(
-            summary=llm.get("summary") or "LLM analysis completed.",
-            findings=dedupe((base_findings or []) + (llm.get("findings") or [])),
-            rewrite_sql=rewrite_final,
-            index_recommendations=dedupe((base_indexes or []) + (llm.get("index_recommendations") or [])),
-            index_script=base_script,
-            risks=dedupe((base_risks or []) + (llm.get("risks") or [])),
-            test_steps=llm.get("test_steps") or [
-                "Capture current plan & metrics.",
-                "Apply one change at a time.",
-                "Compare estimated vs actual plans.",
-                "Benchmark with prod-like data.",
-            ],
-        )
-
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"OpenAI call failed: {e}")
-
-# -------- Streaming endpoint (optional) --------
-@app.post("/analyze/stream")
-def analyze_stream(req: AnalyzeRequest):
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=503, detail="OPENAI_API_KEY missing")
-
-    timeout = httpx.Timeout(connect=15.0, read=120.0, write=120.0, pool=120.0)
-    client = OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client(trust_env=False, timeout=timeout))
-
-    def event_stream():
-        yield "Starting analysis...\n"
-        with client.chat.completions.with_streaming_response.create(
-            model="gpt-4o-mini",
-            temperature=0.2,
-            messages=[
-                {"role":"system","content":"You are a SQL tuning expert."},
-                {"role":"user","content":req.sql_text}
-            ],
-        ) as stream:
-            for event in stream:
-                if event.type == "token":
-                    yield event.token
-        yield "\n\n[done]"
-
-    return StreamingResponse(event_stream(), media_type="text/plain")
