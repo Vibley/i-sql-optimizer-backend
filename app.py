@@ -84,12 +84,15 @@ def static_rules(sql: str):
         tbl_match = re.search(r"\bFROM\s+([A-Z0-9_\.\[\]]+)", sql_compact)
         if not tbl_match:
             tbl_match = re.search(r"\bJOIN\s+([A-Z0-9_\.\[\]]+)", sql_compact)
-        table_name = tbl_match.group(1) if tbl_match else "<YourTable>"
+       
+   table_name = (tbl_match.group(1).lower() if tbl_match else "<yourtable>")
+cols = [c.lower() for c in cols]
 
-        if cols:
-            index_recs.append(
-                f"CREATE INDEX IX_{cols[0]}_Suggested ON {table_name} ({', '.join(cols)});"
-            )
+if cols:
+    index_recs.append(
+        f"CREATE INDEX ix_{cols[0]}_suggested ON {table_name} ({', '.join(cols)});"
+    )
+           
 
     return findings, ("\n".join(rewrites) if rewrites else None), index_recs, risks
 
