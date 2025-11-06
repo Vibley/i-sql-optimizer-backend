@@ -9,7 +9,7 @@ import sqlparse
 for k in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "OPENAI_PROXY"]:
     os.environ.pop(k, None)
 
-# Optional: log OpenAI SDK version at startup (helps verify the pinned SDK on Render)
+# Optional: log OpenAI SDK version at startup
 try:
     import openai  # noqa: F401
     import logging
@@ -20,7 +20,7 @@ except Exception:
 ALLOW_ORIGIN = os.getenv("ALLOW_ORIGIN", "*")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-app = FastAPI(title="AI SQL Optimizer Backend", version="1.3.0")
+app = FastAPI(title="AI SQL Optimizer Backend", version="1.3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -64,13 +64,6 @@ def _month_range(yyyy: int, mm: int):
 
 # ---------- Static rules + simple rewrites ----------
 def static_rules(sql: str):
-    """
-    Returns:
-      findings: List[str]
-      rewrite_out: Optional[str]  (either a concrete rewrite or guidance comments)
-      index_recs: List[str]
-      risks: List[str]
-    """
     findings, guidance_lines, index_recs, risks = [], [], [], []
     sql_norm = sql.strip()
     sql_compact = re.sub(r"\s+", " ", sql_norm, flags=re.MULTILINE).upper()
@@ -104,106 +97,75 @@ def static_rules(sql: str):
     if "WHERE" not in sql_compact and "JOIN" in sql_compact:
         findings.append("JOIN without WHERE may explode rows; verify join predicates and filters.")
 
-    # ---------- Concrete rewrites (apply-in-place where safe) ----------
+    # ---------- Concrete rewrites ----------
     working = sql_norm
     concrete_changes = 0
 
-    # YEAR(col) = YYYY  --> date range for that year
+    # YEAR(col) = YYYY
     for m in re.finditer(r"\bYEAR\s*\(\s*(?P<col>[A-Za-z0-9_\.\[\]]+)\s*\)\s*=\s*(?P<yyyy>19\d{2}|20\d{2})", working, flags=re.IGNORECASE):
         col = m.group("col")
         yyyy = int(m.group("yyyy"))
         start = f"{yyyy:04d}-01-01"
         end   = f"{(yyyy+1):04d}-01-01"
         rng = f"{col} >= '{start}' AND {col} < '{end}'"
-        working = re.sub(
-            r"\bYEAR\s*\(\s*"+re.escape(col)+r"\s*\)\s*=\s*"+str(yyyy),
-            rng,
-            working,
-            count=1,
-            flags=re.IGNORECASE,
-        )
+        working = re.sub(r"\bYEAR\s*\(\s*"+re.escape(col)+r"\s*\)\s*=\s*"+str(yyyy), rng, working, count=1, flags=re.IGNORECASE)
         concrete_changes += 1
-        if "Non-sargable predicate" not in " ".join(findings):
-            findings.append("Non-sargable predicate (function on column) blocks index seeks.")
 
-    # DATE(col) = 'YYYY-MM-DD'  --> day range
+    # DATE(col) = 'YYYY-MM-DD'
     for m in re.finditer(r"\bDATE\s*\(\s*(?P<col>[A-Za-z0-9_\.\[\]]+)\s*\)\s*=\s*'(?P<d>\d{4}-\d{2}-\d{2})'", working, flags=re.IGNORECASE):
-        col = m.group("col")
-        d   = m.group("d")
-        d2  = _iso_next_day(d)
+        col, d = m.group("col"), m.group("d")
+        d2 = _iso_next_day(d)
         rng = f"{col} >= '{d}' AND {col} < '{d2}'"
-        working = re.sub(
-            r"\bDATE\s*\(\s*"+re.escape(col)+r"\s*\)\s*=\s*'"+re.escape(d)+r"'",
-            rng,
-            working,
-            count=1,
-            flags=re.IGNORECASE,
-        )
+        working = re.sub(r"\bDATE\s*\(\s*"+re.escape(col)+r"\s*\)\s*=\s*'"+re.escape(d)+r"'", rng, working, count=1, flags=re.IGNORECASE)
         concrete_changes += 1
 
-    # CAST(col AS DATE) = 'YYYY-MM-DD'  --> day range
+    # CAST(col AS DATE) = 'YYYY-MM-DD'
     for m in re.finditer(r"\bCAST\s*\(\s*(?P<col>[A-Za-z0-9_\.\[\]]+)\s+AS\s+DATE\s*\)\s*=\s*'(?P<d>\d{4}-\d{2}-\d{2})'", working, flags=re.IGNORECASE):
-        col = m.group("col")
-        d   = m.group("d")
-        d2  = _iso_next_day(d)
+        col, d = m.group("col"), m.group("d")
+        d2 = _iso_next_day(d)
         rng = f"{col} >= '{d}' AND {col} < '{d2}'"
-        working = re.sub(
-            r"\bCAST\s*\(\s*"+re.escape(col)+r"\s+AS\s+DATE\s*\)\s*=\s*'"+re.escape(d)+r"'",
-            rng,
-            working,
-            count=1,
-            flags=re.IGNORECASE,
-        )
+        working = re.sub(r"\bCAST\s*\(\s*"+re.escape(col)+r"\s+AS\s+DATE\s*\)\s*=\s*'"+re.escape(d)+r"'", rng, working, count=1, flags=re.IGNORECASE)
         concrete_changes += 1
 
-    # Postgres: col::DATE = 'YYYY-MM-DD'  --> day range
+    # Postgres: col::DATE = 'YYYY-MM-DD'
     for m in re.finditer(r"\b(?P<col>[A-Za-z0-9_\.\[\]]+)\s*::\s*DATE\s*=\s*'(?P<d>\d{4}-\d{2}-\d{2})'", working, flags=re.IGNORECASE):
-        col = m.group("col")
-        d   = m.group("d")
-        d2  = _iso_next_day(d)
+        col, d = m.group("col"), m.group("d")
+        d2 = _iso_next_day(d)
         rng = f"{col} >= '{d}' AND {col} < '{d2}'"
-        working = re.sub(
-            r"\b"+re.escape(col)+r"\s*::\s*DATE\s*=\s*'"+re.escape(d)+r"'",
-            rng,
-            working,
-            count=1,
-            flags=re.IGNORECASE,
-        )
+        working = re.sub(r"\b"+re.escape(col)+r"\s*::\s*DATE\s*=\s*'"+re.escape(d)+r"'", rng, working, count=1, flags=re.IGNORECASE)
         concrete_changes += 1
 
-    # MONTH(col)=M + YEAR(col)=YYYY  --> provide exact month range as guidance
-    # (We do not rewrite in-place because the two predicates may appear in any order/spacing.)
+    # MONTH(col)=M + YEAR(col)=YYYY  -> guidance
     mon = re.search(r"\bMONTH\s*\(\s*(?P<c1>[A-Za-z0-9_\.\[\]]+)\s*\)\s*=\s*(?P<mm>1[0-2]|0?[1-9])", sql_norm, flags=re.IGNORECASE)
     yr  = re.search(r"\bYEAR\s*\(\s*(?P<c2>[A-Za-z0-9_\.\[\]]+)\s*\)\s*=\s*(?P<yyyy>19\d{2}|20\d{2})", sql_norm, flags=re.IGNORECASE)
     if mon and yr:
-        c1 = mon.group("c1"); c2 = yr.group("c2")
-        mm = int(mon.group("mm")); yyyy = int(yr.group("yyyy"))
+        c1, c2 = mon.group("c1"), yr.group("c2")
+        mm, yyyy = int(mon.group("mm")), int(yr.group("yyyy"))
         if c1.lower() == c2.lower():
             start, end = _month_range(yyyy, mm)
-            guidance_lines.append(
-                f"-- Replace MONTH({c1})={mm} AND YEAR({c1})={yyyy} with range:\n"
-                f"-- {c1} >= '{start}' AND {c1} < '{end}'"
-            )
+            guidance_lines.append(f"-- Replace MONTH({c1})={mm} AND YEAR({c1})={yyyy} with range:\n-- {c1} >= '{start}' AND {c1} < '{end}'")
             findings.append("Non-sargable month/year predicates detected; prefer a single range on the date column.")
 
-    # ---------- Index key guess based on equality predicates ----------
+    # ---------- Index key guess with proper table extraction ----------
     m = re.findall(r"\b([A-Z_][A-Z0-9_\.]+)\s*=\s*[@:\w'\-]+", sql_compact)
     if m:
         cols = [col.split(".")[-1].lower() for col in m]
-        cols = list(dict.fromkeys(cols))[:3]  # de-dupe, keep first 3
+        cols = list(dict.fromkeys(cols))[:3]
 
-        # Try to extract table name from query (FROM first, then JOIN), then lowercase
-        tbl_match = re.search(r"\bFROM\s+([A-Z0-9_\.\[\]]+)", sql_compact)
+        # Improved table extraction (supports schema + quoted/bracketed names)
+        tbl_match = re.search(r"\bFROM\s+([A-Za-z0-9_\.\[\]\"`]+)", sql, flags=re.IGNORECASE)
         if not tbl_match:
-            tbl_match = re.search(r"\bJOIN\s+([A-Z0-9_\.\[\]]+)", sql_compact)
-        table_name = tbl_match.group(1).lower() if tbl_match else "<yourtable>"
+            tbl_match = re.search(r"\bJOIN\s+([A-Za-z0-9_\.\[\]\"`]+)", sql, flags=re.IGNORECASE)
 
-        if cols:
-            index_recs.append(
-                f"create index ix_{cols[0]}_suggested on {table_name} ({', '.join(cols)});"
-            )
+        table_name = None
+        if tbl_match:
+            table_name = tbl_match.group(1)
+            table_name = re.sub(r'[\[\]"`]', "", table_name).lower()
 
-    # Choose output rewrite: concrete if we changed anything; else guidance lines (if any)
+        if table_name and cols:
+            index_recs.append(f"create index ix_{cols[0]}_suggested on {table_name} ({', '.join(cols)});")
+
+    # Final rewrite choice
     if concrete_changes > 0:
         rewrite_out = working
     else:
@@ -227,7 +189,7 @@ def analyze(req: AnalyzeRequest):
 
     base_findings, base_rewrite, base_indexes, base_risks = static_rules(sql_fmt)
 
-    # If no API key, return static analysis only
+    # If no API key
     if not OPENAI_API_KEY:
         rewrite_text = base_rewrite or "No query rewrite suggestions were identified."
         return AnalyzeResponse(
@@ -244,12 +206,10 @@ def analyze(req: AnalyzeRequest):
             ],
         )
 
-    # With OpenAI: Chat Completions (JSON mode)
     try:
         import httpx
         from openai import OpenAI
 
-        # httpx client that ignores any *_PROXY env vars
         http_client = httpx.Client(trust_env=False, timeout=30.0)
         client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
 
@@ -257,7 +217,7 @@ def analyze(req: AnalyzeRequest):
             f"You are a veteran {req.dbms} performance engineer. "
             f"Return safe, actionable tuning advice. Use <YourTable> placeholders; never invent schema names."
         )
-        plan = (req.plan_xml or "")[:20000]  # truncate to keep request bounded
+        plan = (req.plan_xml or "")[:20000]
 
         user_msg = (
             "SQL (formatted):\n```\n"
@@ -288,7 +248,6 @@ def analyze(req: AnalyzeRequest):
 
         llm = json.loads(resp.choices[0].message.content)
 
-        # Merge + dedupe helpers
         def dedupe(seq):
             seen, out = set(), []
             for s in seq or []:
@@ -296,36 +255,31 @@ def analyze(req: AnalyzeRequest):
                     seen.add(s); out.append(s)
             return out
 
-        # Strict guardrail to suppress echo rewrites
         def _canon_sql(s: str) -> str:
             s = (s or "")
-            s = re.sub(r"```(?:sql)?", "", s, flags=re.IGNORECASE)  # strip ```sql fences
-            s = s.replace("`", "")
-            s = s.strip()
+            s = re.sub(r"```(?:sql)?", "", s, flags=re.IGNORECASE)
+            s = s.replace("`", "").strip()
             if s.endswith(";"):
                 s = s[:-1]
             s = re.sub(r"\s+", " ", s).strip().lower()
             return s
 
-        rewrite_raw   = llm.get("rewrite_sql") or ""
-        orig_canon    = _canon_sql(sql_fmt)
+        rewrite_raw = llm.get("rewrite_sql") or ""
+        orig_canon = _canon_sql(sql_fmt)
         rewrite_canon = _canon_sql(rewrite_raw)
-
-        # If identical after canonicalization, discard it
         if rewrite_canon and rewrite_canon == orig_canon:
             rewrite = None
         else:
             rewrite = rewrite_raw or None
 
-        # Prefer our static rewrite if present; otherwise show an explicit message
         if not rewrite:
             rewrite = base_rewrite or "No query rewrite suggestions were identified."
 
         findings = dedupe((base_findings or []) + (llm.get("findings") or []))
-        indexes  = dedupe((base_indexes  or []) + (llm.get("index_recommendations") or []))
-        risks    = dedupe((base_risks    or []) + (llm.get("risks") or []))
-        summary  = llm.get("summary") or "Analysis completed."
-        steps    = llm.get("test_steps") or [
+        indexes = dedupe((base_indexes or []) + (llm.get("index_recommendations") or []))
+        risks = dedupe((base_risks or []) + (llm.get("risks") or []))
+        summary = llm.get("summary") or "Analysis completed."
+        steps = llm.get("test_steps") or [
             "Capture current plan & metrics (duration, CPU, reads).",
             "Apply one change at a time (index or rewrite).",
             "Compare estimated vs actual plans; validate row estimates.",
