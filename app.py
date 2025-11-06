@@ -1,11 +1,9 @@
-import os, json, re, datetime, threading
+import os, json, re, datetime
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import sqlparse
-import httpx
-from openai import OpenAI
 
 # -------- Proxy cleanup --------
 for k in ["HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy","OPENAI_PROXY"]:
@@ -13,14 +11,9 @@ for k in ["HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all
 
 ALLOW_ORIGIN   = os.getenv("ALLOW_ORIGIN", "*")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-REQUIRE_OPENAI = os.getenv("REQUIRE_OPENAI", "1") == "1"
+REQUIRE_OPENAI = os.getenv("REQUIRE_OPENAI", "1") == "1"   # <-- force LLM by default
 
-# -------- Shared transport only (not full client) --------
-TRANSPORT = httpx.HTTPTransport(retries=1, verify=True)
-TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=60.0, pool=30.0)
-
-# -------- FastAPI setup --------
-app = FastAPI(title="AI SQL Optimizer Backend", version="1.6.2")
+app = FastAPI(title="AI SQL Optimizer Backend", version="1.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -65,7 +58,7 @@ def _canon_sql(s: str) -> str:
         s = s[:-1]
     return re.sub(r"\s+", " ", s).strip().lower()
 
-# -------- Static rules (unchanged) --------
+# -------- Static rules + rewrites (used in addition to LLM) --------
 def static_rules(sql: str):
     findings, guidance_lines, index_recs, risks = [], [], [], []
     sql_norm = sql.strip()
@@ -94,46 +87,114 @@ def static_rules(sql: str):
     if "WHERE" not in sql_compact and "JOIN" in sql_compact:
         findings.append("JOIN without WHERE may explode rows; verify join predicates and filters.")
 
+    # Concrete rewrites (safe in-place)
     working = sql_norm
     concrete_changes = 0
 
-    # ... rest of static_rules logic unchanged ...
-    # (not repeated for brevity — your original static_rules stays exactly the same)
-    # Paste the unchanged body of static_rules here.
-    # ---------------------------------------------
-    # [Omitted: same as your uploaded code block]
-    # ---------------------------------------------
+    # YEAR(col)=YYYY -> range
+    for m in re.finditer(r"\bYEAR\s*\(\s*(?P<col>[A-Za-z0-9_\.\[\]]+)\s*\)\s*=\s*(?P<yyyy>19\d{2}|20\d{2})", working, flags=re.IGNORECASE):
+        col, yyyy = m.group("col"), int(m.group("yyyy"))
+        start, end = f"{yyyy:04d}-01-01", f"{(yyyy+1):04d}-01-01"
+        rng = f"{col} >= '{start}' AND {col} < '{end}'"
+        working = re.sub(r"\bYEAR\s*\(\s*"+re.escape(col)+r"\s*\)\s*=\s*"+str(yyyy), rng, working, count=1, flags=re.IGNORECASE)
+        concrete_changes += 1
+        if "Non-sargable predicate" not in " ".join(findings):
+            findings.append("Non-sargable predicate (function on column) blocks index seeks.")
+
+    # DATE(col)='YYYY-MM-DD' -> day range
+    for m in re.finditer(r"\bDATE\s*\(\s*(?P<col>[A-Za-z0-9_\.\[\]]+)\s*\)\s*=\s*'(?P<d>\d{4}-\d{2}-\d{2})'", working, flags=re.IGNORECASE):
+        col, d = m.group("col"), m.group("d")
+        d2 = _iso_next_day(d)
+        rng = f"{col} >= '{d}' AND {col} < '{d2}'"
+        working = re.sub(r"\bDATE\s*\(\s*"+re.escape(col)+r"\s*\)\s*=\s*'"+re.escape(d)+r"'", rng, working, count=1, flags=re.IGNORECASE)
+        concrete_changes += 1
+
+    # CAST(col AS DATE)='YYYY-MM-DD' -> day range
+    for m in re.finditer(r"\bCAST\s*\(\s*(?P<col>[A-Za-z0-9_\.\[\]]+)\s+AS\s+DATE\s*\)\s*=\s*'(?P<d>\d{4}-\d{2}-\d{2})'", working, flags=re.IGNORECASE):
+        col, d = m.group("col"), m.group("d")
+        d2 = _iso_next_day(d)
+        rng = f"{col} >= '{d}' AND {col} < '{d2}'"
+        working = re.sub(r"\bCAST\s*\(\s*"+re.escape(col)+r"\s+AS\s+DATE\s*\)\s*=\s*'"+re.escape(d)+r"'", rng, working, count=1, flags=re.IGNORECASE)
+        concrete_changes += 1
+
+    # Postgres: col::date='YYYY-MM-DD' -> day range
+    for m in re.finditer(r"\b(?P<col>[A-Za-z0-9_\.\[\]]+)\s*::\s*DATE\s*=\s*'(?P<d>\d{4}-\d{2}-\d{2})'", working, flags=re.IGNORECASE):
+        col, d = m.group("col"), m.group("d")
+        d2 = _iso_next_day(d)
+        rng = f"{col} >= '{d}' AND {col} < '{d2}'"
+        working = re.sub(r"\b"+re.escape(col)+r"\s*::\s*DATE\s*=\s*'"+re.escape(d)+r"'", rng, working, count=1, flags=re.IGNORECASE)
+        concrete_changes += 1
+
+    # MONTH()+YEAR() -> guidance
+    mon = re.search(r"\bMONTH\s*\(\s*(?P<c1>[A-Za-z0-9_\.\[\]]+)\s*\)\s*=\s*(?P<mm>1[0-2]|0?[1-9])", sql_norm, flags=re.IGNORECASE)
+    yr  = re.search(r"\bYEAR\s*\(\s*(?P<c2>[A-Za-z0-9_\.\[\]]+)\s*\)\s*=\s*(?P<yyyy>19\d{2}|20\d{2})", sql_norm, flags=re.IGNORECASE)
+    if mon and yr and mon.group("c1").lower() == yr.group("c2").lower():
+        mm, yyyy = int(mon.group("mm")), int(yr.group("yyyy"))
+        start, end = _month_range(yyyy, mm)
+        c = mon.group("c1")
+        guidance_lines.append(f"-- Replace MONTH({c})={mm} AND YEAR({c})={yyyy} with:\n-- {c} >= '{start}' AND {c} < '{end}'")
+        findings.append("Non-sargable month/year predicates detected; prefer a single range on the date column.")
+
+    # Index key guess from equality predicates
+    m = re.findall(r"\b([A-Z_][A-Z0-9_\.]+)\s*=\s*[@:\w'\-]+", sql_compact)
+    table_name = None
+    if m:
+        cols = [col.split(".")[-1].lower() for col in m]
+        cols = list(dict.fromkeys(cols))[:3]
+        tbl_match = re.search(r"\bFROM\s+([A-Za-z0-9_\.\[\]\"`]+)", sql, flags=re.IGNORECASE) or \
+                    re.search(r"\bJOIN\s+([A-Za-z0-9_\.\[\]\"`]+)", sql, flags=re.IGNORECASE)
+        if tbl_match:
+            table_name = re.sub(r'[\[\]"`]', "", tbl_match.group(1)).lower()
+        if table_name and cols:
+            index_recs.append(f"create index ix_{cols[0]}_suggested on {table_name} ({', '.join(cols)});")
+
+    # Build executable index script
+    index_script = None
+    if index_recs:
+        lines = ["-- Suggested indexes"]
+        for rec in index_recs:
+            try:
+                ix_name = re.search(r"ix_[a-z0-9_]+", rec, flags=re.IGNORECASE).group(0)
+                on_tbl  = re.search(r"on\s+([^\s(]+)", rec, flags=re.IGNORECASE).group(1)
+                cols_in = re.search(r"\(([^)]+)\)", rec).group(1)
+                cols_clean = ", ".join([c.strip() for c in cols_in.split(",")])
+                lines.append(
+                    "IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = '{ix}' AND object_id = OBJECT_ID('{tbl}'))\n"
+                    "BEGIN\n"
+                    "    CREATE INDEX {ix} ON {tbl} ({cols});\n"
+                    "END\nGO".format(ix=ix_name, tbl=on_tbl, cols=cols_clean)
+                )
+            except Exception:
+                lines.append(rec if rec.strip().endswith(";") else rec.strip() + ";")
+                lines.append("GO")
+        index_script = "\n".join(lines)
 
     rewrite_out = working if concrete_changes > 0 else ("\n".join(guidance_lines) if guidance_lines else None)
-    return findings, rewrite_out, index_recs, None, risks
+    return findings, rewrite_out, index_recs, index_script, risks
 
 # -------- Health --------
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# -------- OpenAI diag --------
+# -------- Quick OpenAI diag --------
 @app.get("/diag/openai")
 def diag_openai():
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=503, detail="OPENAI_API_KEY is not set.")
     try:
-        client = OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client(transport=TRANSPORT, timeout=TIMEOUT))
-        _ = client.chat.completions.create(model="gpt-4o", messages=[{"role":"user","content":"ping"}], max_tokens=1)
+        import httpx
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client(trust_env=False, timeout=10.0))
+        # minimal ping
+        _ = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=1,
+        )
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"OpenAI check failed: {e}")
-
-# -------- Warmup thread (to reduce cold-start delay) --------
-def _warmup_openai():
-    try:
-        client = OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client(transport=TRANSPORT, timeout=TIMEOUT))
-        client.chat.completions.create(model="gpt-4o", messages=[{"role":"user","content":"warmup"}], max_tokens=1)
-        print("[Warmup] OpenAI client warmed up successfully.")
-    except Exception as e:
-        print(f"[Warmup] Skipped: {e}")
-
-threading.Thread(target=_warmup_openai, daemon=True).start()
 
 # -------- Analyze --------
 @app.post("/analyze", response_model=AnalyzeResponse)
@@ -146,41 +207,60 @@ def analyze(req: AnalyzeRequest):
 
     base_findings, base_rewrite, base_indexes, base_script, base_risks = static_rules(sql_fmt)
 
+    # Require OpenAI when configured
     if not OPENAI_API_KEY:
         if REQUIRE_OPENAI:
-            raise HTTPException(status_code=503, detail="OpenAI is required but missing.")
+            raise HTTPException(
+                status_code=503,
+                detail="OpenAI is required but OPENAI_API_KEY is missing. Set the env var or disable REQUIRE_OPENAI."
+            )
+        # Optional static fallback (only if REQUIRE_OPENAI=0)
         return AnalyzeResponse(
             summary="Static analysis completed (OpenAI not configured).",
             findings=base_findings or ["No obvious issues detected."],
-            rewrite_sql=base_rewrite or "No rewrite suggestions.",
+            rewrite_sql=base_rewrite or "No query rewrite suggestions were identified.",
             index_recommendations=base_indexes,
             index_script=base_script,
             risks=base_risks,
             test_steps=[
-                "Capture plan & metrics.",
-                "Apply one change at a time.",
-                "Compare estimated vs actual plans.",
-                "Benchmark on prod-like data.",
+                "Capture current plan & metrics (duration, CPU, reads).",
+                "Apply one change at a time (index or rewrite).",
+                "Compare estimated vs actual plans; validate row estimates.",
+                "Benchmark on prod-like data; check regressions.",
             ],
         )
 
+    # OpenAI-enhanced path
     try:
-        client = OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client(transport=TRANSPORT, timeout=TIMEOUT))
-        system_msg = f"You are a veteran {req.dbms} performance engineer. Return safe, actionable tuning advice."
+        import httpx
+        from openai import OpenAI
+        http_client = httpx.Client(trust_env=False, timeout=30.0)
+        client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
+
+        system_msg = (
+            f"You are a veteran {req.dbms} performance engineer. "
+            f"Return safe, actionable tuning advice. Use <YourTable> placeholders; never invent schema names."
+        )
         plan = (req.plan_xml or "")[:20000]
+
         user_msg = (
-            f"SQL (formatted):\n```\n{sql_fmt}\n```\n\nContext:\n{req.context or 'n/a'}\n\n"
-            f"Execution plan XML:\n{plan if plan else 'n/a'}\n"
+            "SQL (formatted):\n```\n"
+            f"{sql_fmt}\n```\n\nContext:\n"
+            f"{req.context or 'n/a'}\n\nExecution plan XML (optional):\n"
+            f"{plan if plan else 'n/a'}\n"
         )
 
         json_instructions = (
             "Return a JSON object with keys: summary (string), findings (array of strings), "
             "rewrite_sql (string), index_recommendations (array of strings), risks (array of strings), "
-            "test_steps (array of strings). No extra text."
+            "test_steps (array of strings). "
+            "If your rewrite would be identical to the provided SQL after formatting "
+            "(ignoring case/whitespace/semicolon), set rewrite_sql to an empty string. "
+            "Prefer sargable range predicates over functions on columns. No extra keys or text."
         )
 
         resp = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o-mini",
             temperature=0.2,
             response_format={"type": "json_object"},
             messages=[
@@ -191,12 +271,13 @@ def analyze(req: AnalyzeRequest):
         )
         llm = json.loads(resp.choices[0].message.content)
 
+        # Merge + guard
         def dedupe(seq): return list(dict.fromkeys(seq or []))
         rewrite_raw = llm.get("rewrite_sql") or ""
-        same = _canon_sql(rewrite_raw) == _canon_sql(sql_fmt)
-        rewrite_final = None if same else (rewrite_raw or None)
+        same_as_input = _canon_sql(rewrite_raw) == _canon_sql(sql_fmt)
+        rewrite_final = None if same_as_input else (rewrite_raw or None)
         if not rewrite_final:
-            rewrite_final = base_rewrite or "No rewrite suggestions."
+            rewrite_final = base_rewrite or "No query rewrite suggestions were identified."
 
         return AnalyzeResponse(
             summary=llm.get("summary") or "LLM analysis completed.",
@@ -206,12 +287,13 @@ def analyze(req: AnalyzeRequest):
             index_script=base_script,
             risks=dedupe((base_risks or []) + (llm.get("risks") or [])),
             test_steps=llm.get("test_steps") or [
-                "Capture plan & metrics.",
-                "Apply one change at a time.",
-                "Compare estimated vs actual plans.",
-                "Benchmark with prod-like data.",
+                "Capture current plan & metrics (duration, CPU, reads).",
+                "Apply one change at a time (index or rewrite).",
+                "Compare estimated vs actual plans; validate row estimates.",
+                "Benchmark on prod-like data; check regressions.",
             ],
         )
 
     except Exception as e:
+        # Fail *loudly* if OpenAI path can’t be used (keeps you out of static mode)
         raise HTTPException(status_code=502, detail=f"OpenAI call failed: {e}")
