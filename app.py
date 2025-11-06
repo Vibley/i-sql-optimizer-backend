@@ -119,7 +119,7 @@ def diag_openai():
         raise HTTPException(status_code=503, detail="OPENAI_API_KEY is not set.")
     try:
         client = OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client(transport=TRANSPORT, timeout=TIMEOUT))
-        _ = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role":"user","content":"ping"}], max_tokens=1)
+        _ = client.chat.completions.create(model="gpt-4o", messages=[{"role":"user","content":"ping"}], max_tokens=1)
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"OpenAI check failed: {e}")
@@ -128,7 +128,7 @@ def diag_openai():
 def _warmup_openai():
     try:
         client = OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client(transport=TRANSPORT, timeout=TIMEOUT))
-        client.chat.completions.create(model="gpt-4o-mini", messages=[{"role":"user","content":"warmup"}], max_tokens=1)
+        client.chat.completions.create(model="gpt-4o", messages=[{"role":"user","content":"warmup"}], max_tokens=1)
         print("[Warmup] OpenAI client warmed up successfully.")
     except Exception as e:
         print(f"[Warmup] Skipped: {e}")
@@ -180,7 +180,7 @@ def analyze(req: AnalyzeRequest):
         )
 
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             temperature=0.2,
             response_format={"type": "json_object"},
             messages=[
