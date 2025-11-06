@@ -2,27 +2,25 @@ import os, json, re
 from typing import List, Optional
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import sqlparse
 
-# --- Kill any proxy envs that could confuse the OpenAI SDK/httpx ---
+# --- Remove any proxy envs that could confuse OpenAI/httpx ---
 for k in ["HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy","OPENAI_PROXY"]:
     os.environ.pop(k, None)
 
-# (Optional) Log the OpenAI SDK version at startup so we can verify cache
+# Optional: log OpenAI SDK version at startup
 try:
-    import openai
+    import openai  # noqa: F401
     import logging
     logging.getLogger("uvicorn.error").info(f"OpenAI SDK version: {openai.__version__}")
 except Exception:
     pass
 
-
-
 ALLOW_ORIGIN = os.getenv("ALLOW_ORIGIN", "*")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-app = FastAPI(title="AI SQL Optimizer Backend", version="1.1.1")
+app = FastAPI(title="AI SQL Optimizer Backend", version="1.1.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,6 +30,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------- Models ----------
 class AnalyzeRequest(BaseModel):
     dbms: str = "sqlserver"
     sql_text: str
@@ -41,12 +40,13 @@ class AnalyzeRequest(BaseModel):
 
 class AnalyzeResponse(BaseModel):
     summary: str
-    findings: List[str]
+    findings: List[str] = Field(default_factory=list)
     rewrite_sql: Optional[str] = None
-    index_recommendations: List[str] = []
-    risks: List[str] = []
-    test_steps: List[str] = []
+    index_recommendations: List[str] = Field(default_factory=list)
+    risks: List[str] = Field(default_factory=list)
+    test_steps: List[str] = Field(default_factory=list)
 
+# ---------- Static rules ----------
 def static_rules(sql: str):
     findings, rewrites, index_recs, risks = [], [], [], []
     sql_norm = sql.strip()
@@ -74,6 +74,7 @@ def static_rules(sql: str):
     if "WHERE" not in sql_compact and "JOIN" in sql_compact:
         findings.append("JOIN without WHERE may explode rows; verify join predicates and filters.")
 
+    # Guess composite index keys from equality predicates like t.Col = @p
     m = re.findall(r"\b([A-Z_][A-Z0-9_\.]+)\s*=\s*[@:\w'\-]+", sql_compact)
     if m:
         cols = []
@@ -85,10 +86,12 @@ def static_rules(sql: str):
 
     return findings, ("\n".join(rewrites) if rewrites else None), index_recs, risks
 
+# ---------- Health ----------
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+# ---------- Analyze ----------
 @app.post("/analyze", response_model=AnalyzeResponse)
 def analyze(req: AnalyzeRequest):
     sql = req.sql_text or ""
@@ -99,6 +102,7 @@ def analyze(req: AnalyzeRequest):
 
     base_findings, base_rewrite, base_indexes, base_risks = static_rules(sql_fmt)
 
+    # No key -> static only
     if not OPENAI_API_KEY:
         return AnalyzeResponse(
             summary="Static analysis completed (OpenAI not configured).",
@@ -110,25 +114,25 @@ def analyze(req: AnalyzeRequest):
                 "Capture current plan & metrics (duration, CPU, reads).",
                 "Apply one change at a time (index or rewrite).",
                 "Compare estimated vs actual plans; validate row estimates.",
-                "Benchmark on prod-like data; check regressions."
+                "Benchmark on prod-like data; check regressions.",
             ],
         )
 
+    # OpenAI call with httpx client that ignores *_PROXY env vars
     try:
+        import httpx
         from openai import OpenAI
-import httpx
 
-# trust_env=False means httpx will NOT read any *_PROXY env vars
-http_client = httpx.Client(trust_env=False, timeout=30.0)
-client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
-
+        http_client = httpx.Client(trust_env=False, timeout=30.0)
+        client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
 
         system_msg = (
             f"You are a veteran {req.dbms} performance engineer. "
             f"Return safe, actionable tuning advice. Use <YourTable> placeholders; never invent schema names."
         )
-        plan = (req.plan_xml or "")[:20000]
+        plan = (req.plan_xml or "")[:20000]  # truncate to keep request bounded
 
+        # Build prompt (avoid triple-quoted f-strings)
         user_msg = (
             "SQL (formatted):\n"
             "```\n"
@@ -160,6 +164,7 @@ client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
 
         llm = json.loads(resp.choices[0].message.content)
 
+        # Merge + dedupe
         def dedupe(seq):
             seen, out = set(), []
             for s in seq or []:
@@ -168,15 +173,15 @@ client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
             return out
 
         findings = dedupe((base_findings or []) + (llm.get("findings") or []))
-        indexes = dedupe((base_indexes or []) + (llm.get("index_recommendations") or []))
-        risks = dedupe((base_risks or []) + (llm.get("risks") or []))
-        rewrite = llm.get("rewrite_sql") or base_rewrite
-        summary = llm.get("summary") or "Analysis completed."
-        steps = llm.get("test_steps") or [
+        indexes  = dedupe((base_indexes  or []) + (llm.get("index_recommendations") or []))
+        risks    = dedupe((base_risks    or []) + (llm.get("risks") or []))
+        rewrite  = llm.get("rewrite_sql") or base_rewrite
+        summary  = llm.get("summary") or "Analysis completed."
+        steps    = llm.get("test_steps") or [
             "Capture current plan & metrics (duration, CPU, reads).",
             "Apply one change at a time (index or rewrite).",
             "Compare estimated vs actual plans; validate row estimates.",
-            "Benchmark on prod-like data; check regressions."
+            "Benchmark on prod-like data; check regressions.",
         ]
 
         return AnalyzeResponse(
@@ -200,6 +205,6 @@ client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
                 "Capture current plan & metrics (duration, CPU, reads).",
                 "Apply one change at a time (index or rewrite).",
                 "Compare estimated vs actual plans; validate row estimates.",
-                "Benchmark on prod-like data; check regressions."
+                "Benchmark on prod-like data; check regressions.",
             ],
         )
