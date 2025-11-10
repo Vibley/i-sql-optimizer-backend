@@ -11,9 +11,9 @@ for k in ["HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all
 
 ALLOW_ORIGIN   = os.getenv("ALLOW_ORIGIN", "*")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-REQUIRE_OPENAI = os.getenv("REQUIRE_OPENAI", "1") == "1"   # <-- force LLM by default
+REQUIRE_OPENAI = os.getenv("REQUIRE_OPENAI", "1") == "1"
 
-app = FastAPI(title="AI SQL Optimizer Backend", version="1.7.0")
+app = FastAPI(title="AI SQL Optimizer Backend", version="1.7.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -58,9 +58,110 @@ def _canon_sql(s: str) -> str:
         s = s[:-1]
     return re.sub(r"\s+", " ", s).strip().lower()
 
-# -------- Static analysis (unchanged) --------
-# (your full static_rules() function remains the same)
-# -------- Health & Diag --------
+# -------- Static analysis rules --------
+def static_rules(sql: str):
+    findings, guidance_lines, index_recs, risks = [], [], [], []
+    sql_norm = sql.strip()
+    sql_compact = re.sub(r"\s+", " ", sql_norm, flags=re.MULTILINE).upper()
+
+    if re.search(r"\bSELECT\s+\*\b", sql_compact):
+        findings.append("Avoid SELECT *. Project only required columns.")
+        risks.append("Extra I/O and wider rows reduce buffer cache efficiency.")
+        guidance_lines.append("-- Replace SELECT * with only required columns.")
+
+    if re.search(r"LIKE\s+['\"]%[^'\"]+['\"]", sql_compact):
+        findings.append("Leading wildcard LIKE prevents index seeks.")
+        guidance_lines.append("-- Consider full-text index (CONTAINS) or trigram search.")
+        risks.append("Full scans on large tables can be expensive.")
+
+    if re.search(r"WHERE\s+.*\b(YEAR|MONTH|DAY|DATE|DATEADD|DATEDIFF|SUBSTRING|CAST|CONVERT)\s*\(", sql_compact) or re.search(r"::\s*DATE\b", sql_norm, flags=re.IGNORECASE):
+        findings.append("Non-sargable predicate (function/cast on column) can block index seeks.")
+        guidance_lines.append("-- Prefer sargable range predicates over functions/casts on columns.")
+
+    if re.search(r"\bWHERE\b.*\bOR\b", sql_compact):
+        findings.append("OR conditions may reduce index usage; consider UNION ALL or indexed computed columns.")
+
+    if "ORDER BY" in sql_compact and "JOIN" not in sql_compact:
+        findings.append("ORDER BY detected; ensure index supports ORDER BY key(s).")
+
+    if "WHERE" not in sql_compact and "JOIN" in sql_compact:
+        findings.append("JOIN without WHERE may explode rows; verify join predicates and filters.")
+
+    # --- Transformations ---
+    working = sql_norm
+    concrete_changes = 0
+
+    # YEAR(col)=YYYY -> range
+    for m in re.finditer(r"\bYEAR\s*\(\s*(?P<col>[A-Za-z0-9_\.\[\]]+)\s*\)\s*=\s*(?P<yyyy>19\d{2}|20\d{2})", working, flags=re.IGNORECASE):
+        col, yyyy = m.group("col"), int(m.group("yyyy"))
+        start, end = f"{yyyy:04d}-01-01", f"{(yyyy+1):04d}-01-01"
+        rng = f"{col} >= '{start}' AND {col} < '{end}'"
+        working = re.sub(r"\bYEAR\s*\(\s*"+re.escape(col)+r"\s*\)\s*=\s*"+str(yyyy), rng, working, count=1, flags=re.IGNORECASE)
+        concrete_changes += 1
+        if "Non-sargable predicate" not in " ".join(findings):
+            findings.append("Non-sargable predicate (function on column) blocks index seeks.")
+
+    # DATE(col)='YYYY-MM-DD' -> day range
+    for m in re.finditer(r"\bDATE\s*\(\s*(?P<col>[A-Za-z0-9_\.\[\]]+)\s*\)\s*=\s*'(?P<d>\d{4}-\d{2}-\d{2})'", working, flags=re.IGNORECASE):
+        col, d = m.group("col"), m.group("d")
+        d2 = _iso_next_day(d)
+        rng = f"{col} >= '{d}' AND {col} < '{d2}'"
+        working = re.sub(r"\bDATE\s*\(\s*"+re.escape(col)+r"\s*\)\s*=\s*'"+re.escape(d)+r"'", rng, working, count=1, flags=re.IGNORECASE)
+        concrete_changes += 1
+
+    # CAST(col AS DATE)='YYYY-MM-DD' -> day range
+    for m in re.finditer(r"\bCAST\s*\(\s*(?P<col>[A-Za-z0-9_\.\[\]]+)\s+AS\s+DATE\s*\)\s*=\s*'(?P<d>\d{4}-\d{2}-\d{2})'", working, flags=re.IGNORECASE):
+        col, d = m.group("col"), m.group("d")
+        d2 = _iso_next_day(d)
+        rng = f"{col} >= '{d}' AND {col} < '{d2}'"
+        working = re.sub(r"\bCAST\s*\(\s*"+re.escape(col)+r"\s+AS\s+DATE\s*\)\s*=\s*'"+re.escape(d)+r"'", rng, working, count=1, flags=re.IGNORECASE)
+        concrete_changes += 1
+
+    # MONTH()+YEAR() combination guidance
+    mon = re.search(r"\bMONTH\s*\(\s*(?P<c1>[A-Za-z0-9_\.\[\]]+)\s*\)\s*=\s*(?P<mm>1[0-2]|0?[1-9])", sql_norm, flags=re.IGNORECASE)
+    yr  = re.search(r"\bYEAR\s*\(\s*(?P<c2>[A-Za-z0-9_\.\[\]]+)\s*\)\s*=\s*(?P<yyyy>19\d{2}|20\d{2})", sql_norm, flags=re.IGNORECASE)
+    if mon and yr and mon.group("c1").lower() == yr.group("c2").lower():
+        mm, yyyy = int(mon.group("mm")), int(yr.group("yyyy"))
+        start, end = _month_range(yyyy, mm)
+        c = mon.group("c1")
+        guidance_lines.append(f"-- Replace MONTH({c})={mm} AND YEAR({c})={yyyy} with:\n-- {c} >= '{start}' AND {c} < '{end}'")
+        findings.append("Non-sargable month/year predicates detected; prefer a single range on the date column.")
+
+    # Index guess
+    m = re.findall(r"\b([A-Z_][A-Z0-9_\.]+)\s*=\s*[@:\w'\-]+", sql_compact)
+    table_name = None
+    if m:
+        cols = [col.split(".")[-1].lower() for col in m]
+        cols = list(dict.fromkeys(cols))[:3]
+        tbl_match = re.search(r"\bFROM\s+([A-Za-z0-9_\.\[\]\"`]+)", sql, flags=re.IGNORECASE) or \
+                    re.search(r"\bJOIN\s+([A-Za-z0-9_\.\[\]\"`]+)", sql, flags=re.IGNORECASE)
+        if tbl_match:
+            table_name = re.sub(r'[\[\]"`]', "", tbl_match.group(1)).lower()
+        if table_name and cols:
+            index_recs.append(f"create index ix_{cols[0]}_suggested on {table_name} ({', '.join(cols)});")
+
+    index_script = None
+    if index_recs:
+        lines = ["-- Suggested indexes"]
+        for rec in index_recs:
+            try:
+                ix_name = re.search(r"ix_[a-z0-9_]+", rec, flags=re.IGNORECASE).group(0)
+                on_tbl  = re.search(r"on\s+([^\s(]+)", rec, flags=re.IGNORECASE).group(1)
+                cols_in = re.search(r"\(([^)]+)\)", rec).group(1)
+                cols_clean = ", ".join([c.strip() for c in cols_in.split(",")])
+                lines.append(
+                    f"IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = '{ix_name}' AND object_id = OBJECT_ID('{on_tbl}'))\n"
+                    f"BEGIN\n    CREATE INDEX {ix_name} ON {on_tbl} ({cols_clean});\nEND\nGO"
+                )
+            except Exception:
+                lines.append(rec.strip() + (";" if not rec.strip().endswith(";") else ""))
+                lines.append("GO")
+        index_script = "\n".join(lines)
+
+    rewrite_out = working if concrete_changes > 0 else ("\n".join(guidance_lines) if guidance_lines else None)
+    return findings, rewrite_out, index_recs, index_script, risks
+
+# -------- Health --------
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -73,11 +174,7 @@ def diag_openai():
         import httpx
         from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client(timeout=10.0))
-        _ = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": "ping"}],
-            max_tokens=1,
-        )
+        _ = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": "ping"}], max_tokens=1)
         return {"ok": True}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"OpenAI check failed: {e}")
@@ -91,10 +188,8 @@ def analyze(req: AnalyzeRequest):
     except Exception:
         sql_fmt = sql
 
-    from sqlparse import format as fmt
     base_findings, base_rewrite, base_indexes, base_script, base_risks = static_rules(sql_fmt)
 
-    # No OpenAI key
     if not OPENAI_API_KEY:
         if REQUIRE_OPENAI:
             raise HTTPException(status_code=503, detail="OpenAI key missing.")
@@ -113,7 +208,6 @@ def analyze(req: AnalyzeRequest):
             ],
         )
 
-    # --- GPT-Enhanced Analysis ---
     try:
         import httpx
         from openai import OpenAI
@@ -127,7 +221,6 @@ def analyze(req: AnalyzeRequest):
             f"{req.context or 'n/a'}\n\nExecution Plan XML:\n"
             f"{plan if plan else 'n/a'}"
         )
-
         json_instructions = (
             "Respond ONLY with a JSON object having keys: "
             "summary (string), findings (array of strings), rewrite_sql (string), "
@@ -149,10 +242,8 @@ def analyze(req: AnalyzeRequest):
         try:
             llm = json.loads(llm_raw)
         except Exception:
-            # Fallback if GPT didn’t strictly output JSON
             llm = {"summary": llm_raw, "findings": [], "rewrite_sql": "", "index_recommendations": [], "risks": [], "test_steps": []}
 
-        # --- Add missing fields to ensure all components exist ---
         defaults = {
             "summary": "LLM analysis completed.",
             "findings": [],
