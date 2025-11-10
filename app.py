@@ -191,11 +191,18 @@ def analyze(req: AnalyzeRequest):
             llm.setdefault(k, v)
 
         def dedupe(seq): return list(dict.fromkeys(seq or []))
-        rewrite_raw = llm.get("rewrite_sql") or ""
-        same_as_input = _canon_sql(rewrite_raw) == _canon_sql(sql_fmt)
-        rewrite_final = None if same_as_input else (rewrite_raw or None)
-        if not rewrite_final:
-            rewrite_final = base_rewrite or "No query rewrite suggestions were identified."
+       
+      # 🧹 Clean up markdown fences like ```sql, ```json, or ```
+rewrite_raw = llm.get("rewrite_sql") or ""
+rewrite_clean = re.sub(r"```(?:sql|json|text)?", "", rewrite_raw, flags=re.IGNORECASE)
+rewrite_clean = rewrite_clean.replace("```", "").strip()
+
+# Detect if rewritten SQL is identical to input
+same_as_input = _canon_sql(rewrite_clean) == _canon_sql(sql_fmt)
+rewrite_final = None if same_as_input else (rewrite_clean or None)
+if not rewrite_final:
+    rewrite_final = base_rewrite or "No query rewrite suggestions were identified."
+
 
         return AnalyzeResponse(
             summary=f"({req.dbms.upper()} {version_label}) - {llm.get('summary')}",
