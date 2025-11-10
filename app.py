@@ -11,9 +11,9 @@ for k in ["HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all
 
 ALLOW_ORIGIN   = os.getenv("ALLOW_ORIGIN", "*")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-REQUIRE_OPENAI = os.getenv("REQUIRE_OPENAI", "1") == "1"   # <-- force LLM by default
+REQUIRE_OPENAI = os.getenv("REQUIRE_OPENAI", "1") == "1"
 
-app = FastAPI(title="AI SQL Optimizer Backend", version="1.6.0")
+app = FastAPI(title="AI SQL Optimizer Backend", version="1.7.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,7 +29,7 @@ class AnalyzeRequest(BaseModel):
     sql_text: str
     plan_xml: Optional[str] = None
     context: Optional[str] = None
-    version: Optional[str] = None
+    version: Optional[str] = None   # ✅ added version support
 
 class AnalyzeResponse(BaseModel):
     summary: str
@@ -41,15 +41,6 @@ class AnalyzeResponse(BaseModel):
     test_steps: List[str] = Field(default_factory=list)
 
 # -------- Helpers --------
-def _iso_next_day(d: str) -> str:
-    y, m, day = map(int, d.split("-"))
-    return (datetime.date(y, m, day) + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-
-def _month_range(yyyy: int, mm: int):
-    start = datetime.date(yyyy, mm, 1)
-    nxt = datetime.date(yyyy + (1 if mm == 12 else 0), 1 if mm == 12 else mm + 1, 1)
-    return start.strftime("%Y-%m-%d"), nxt.strftime("%Y-%m-%d")
-
 def _canon_sql(s: str) -> str:
     s = (s or "")
     s = re.sub(r"```(?:sql)?", "", s, flags=re.IGNORECASE)
@@ -74,7 +65,7 @@ def static_rules(sql: str):
         guidance_lines.append("-- Consider full-text index (CONTAINS) or trigram search.")
         risks.append("Full scans on large tables can be expensive.")
 
-    if re.search(r"WHERE\s+.*\b(YEAR|MONTH|DAY|DATE|DATEADD|DATEDIFF|SUBSTRING|CAST|CONVERT)\s*\(", sql_compact) or re.search(r"::\s*DATE\b", sql_norm, flags=re.IGNORECASE):
+    if re.search(r"WHERE\s+.*\b(YEAR|MONTH|DAY|DATE|DATEADD|DATEDIFF|SUBSTRING|CAST|CONVERT)\s*\(", sql_compact):
         findings.append("Non-sargable predicate (function/cast on column) can block index seeks.")
         guidance_lines.append("-- Prefer sargable range predicates over functions/casts on columns.")
 
@@ -87,39 +78,20 @@ def static_rules(sql: str):
     if "WHERE" not in sql_compact and "JOIN" in sql_compact:
         findings.append("JOIN without WHERE may explode rows; verify join predicates and filters.")
 
-    # Concrete rewrites
     working = sql_norm
-    concrete_changes = 0
-
-    # YEAR(col)=YYYY -> range
     for m in re.finditer(r"\bYEAR\s*\(\s*(?P<col>[A-Za-z0-9_\.\[\]]+)\s*\)\s*=\s*(?P<yyyy>19\d{2}|20\d{2})", working, flags=re.IGNORECASE):
         col, yyyy = m.group("col"), int(m.group("yyyy"))
         start, end = f"{yyyy:04d}-01-01", f"{(yyyy+1):04d}-01-01"
         rng = f"{col} >= '{start}' AND {col} < '{end}'"
         working = re.sub(r"\bYEAR\s*\(\s*"+re.escape(col)+r"\s*\)\s*=\s*"+str(yyyy), rng, working, count=1, flags=re.IGNORECASE)
-        concrete_changes += 1
 
-    rewrite_out = working if concrete_changes > 0 else ("\n".join(guidance_lines) if guidance_lines else None)
+    rewrite_out = working if working != sql_norm else ("\n".join(guidance_lines) if guidance_lines else None)
     return findings, rewrite_out, index_recs, None, risks
 
 # -------- Health --------
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
-# -------- OpenAI diag --------
-@app.get("/diag/openai")
-def diag_openai():
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=503, detail="OPENAI_API_KEY is not set.")
-    try:
-        import httpx
-        from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client(trust_env=False, timeout=10.0))
-        _ = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": "ping"}], max_tokens=1)
-        return {"ok": True}
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"OpenAI check failed: {e}")
 
 # -------- Analyze --------
 @app.post("/analyze", response_model=AnalyzeResponse)
@@ -132,6 +104,7 @@ def analyze(req: AnalyzeRequest):
 
     base_findings, base_rewrite, base_indexes, base_script, base_risks = static_rules(sql_fmt)
 
+    # --- No OpenAI key fallback ---
     if not OPENAI_API_KEY:
         if REQUIRE_OPENAI:
             raise HTTPException(status_code=503, detail="OpenAI_API_KEY missing.")
@@ -150,23 +123,31 @@ def analyze(req: AnalyzeRequest):
             ],
         )
 
+    # --- OpenAI call ---
     try:
         import httpx
         from openai import OpenAI
+
         http_client = httpx.Client(trust_env=False, timeout=30.0)
         client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
 
+        # 🧠 Version-aware system message
+        version_label = req.version or "latest"
         system_msg = (
-            f"You are a veteran {req.dbms} performance engineer. "
-            f"Return safe, actionable tuning advice. Use <YourTable> placeholders; never invent schema names."
+            f"You are a veteran {req.dbms} performance engineer specializing in SQL Server {version_label}. "
+            f"Only suggest features and syntax compatible with SQL Server {version_label}. "
+            "If a feature was introduced after that version, explain the alternative. "
+            "Return safe, actionable tuning advice using only supported syntax. "
+            "Use <YourTable> placeholders; never invent schema names."
         )
+
         plan = (req.plan_xml or "")[:20000]
         user_msg = (
-            "SQL (formatted):\n```\n"
-            f"{sql_fmt}\n```\n\nContext:\n"
-            f"{req.context or 'n/a'}\n\nExecution plan XML (optional):\n"
-            f"{plan if plan else 'n/a'}\n"
+            f"SQL (formatted):\n```\n{sql_fmt}\n```\n\n"
+            f"Context:\n{req.context or 'n/a'}\n\n"
+            f"Execution plan XML (optional):\n{plan if plan else 'n/a'}\n"
         )
+
         json_instructions = (
             "Return a JSON object with keys: summary, findings, rewrite_sql, "
             "index_recommendations, risks, and test_steps. "
@@ -183,9 +164,10 @@ def analyze(req: AnalyzeRequest):
                 {"role": "user", "content": json_instructions},
             ],
         )
+
         llm = json.loads(resp.choices[0].message.content)
 
-        # 🧠 Handle nested JSON inside summary
+        # 🧩 Merge nested JSON if returned in summary
         if isinstance(llm.get("summary"), str) and llm["summary"].strip().startswith("```json"):
             try:
                 inner_json = re.search(r"\{.*\}", llm["summary"], re.DOTALL)
@@ -197,9 +179,8 @@ def analyze(req: AnalyzeRequest):
             except Exception as e:
                 print("⚠️ Nested JSON parse failed:", e)
 
-        # Fill in missing keys
         defaults = {
-            "summary": "LLM analysis completed.",
+            "summary": f"LLM analysis completed for SQL Server {version_label}.",
             "findings": [],
             "rewrite_sql": "",
             "index_recommendations": [],
@@ -217,7 +198,7 @@ def analyze(req: AnalyzeRequest):
             rewrite_final = base_rewrite or "No query rewrite suggestions were identified."
 
         return AnalyzeResponse(
-            summary=llm.get("summary"),
+            summary=f"({req.dbms.upper()} {version_label}) - {llm.get('summary')}",
             findings=dedupe((base_findings or []) + (llm.get("findings") or [])),
             rewrite_sql=rewrite_final,
             index_recommendations=dedupe((base_indexes or []) + (llm.get("index_recommendations") or [])),
@@ -230,5 +211,6 @@ def analyze(req: AnalyzeRequest):
                 "Benchmark on prod-like data; check regressions.",
             ],
         )
+
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"OpenAI call failed: {e}")
