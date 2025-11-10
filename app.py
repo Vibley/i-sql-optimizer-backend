@@ -6,12 +6,12 @@ from pydantic import BaseModel, Field
 import sqlparse
 
 # -------- Proxy cleanup --------
-for k in ["HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","http_proxy","https_proxy","all_proxy","OPENAI_PROXY"]:
+for k in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "OPENAI_PROXY"]:
     os.environ.pop(k, None)
 
-ALLOW_ORIGIN   = os.getenv("ALLOW_ORIGIN", "*")
+ALLOW_ORIGIN = os.getenv("ALLOW_ORIGIN", "*")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-REQUIRE_OPENAI = os.getenv("REQUIRE_OPENAI", "1") == "1"
+REQUIRE_OPENAI = os.getenv("REQUIRE_OPENAI", "1") == "1"  # <-- force LLM by default
 
 app = FastAPI(title="AI SQL Optimizer Backend", version="1.7.0")
 
@@ -29,7 +29,8 @@ class AnalyzeRequest(BaseModel):
     sql_text: str
     plan_xml: Optional[str] = None
     context: Optional[str] = None
-    version: Optional[str] = None   # ✅ added version support
+    version: Optional[str] = None
+
 
 class AnalyzeResponse(BaseModel):
     summary: str
@@ -40,7 +41,19 @@ class AnalyzeResponse(BaseModel):
     risks: List[str] = Field(default_factory=list)
     test_steps: List[str] = Field(default_factory=list)
 
+
 # -------- Helpers --------
+def _iso_next_day(d: str) -> str:
+    y, m, day = map(int, d.split("-"))
+    return (datetime.date(y, m, day) + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def _month_range(yyyy: int, mm: int):
+    start = datetime.date(yyyy, mm, 1)
+    nxt = datetime.date(yyyy + (1 if mm == 12 else 0), 1 if mm == 12 else mm + 1, 1)
+    return start.strftime("%Y-%m-%d"), nxt.strftime("%Y-%m-%d")
+
+
 def _canon_sql(s: str) -> str:
     s = (s or "")
     s = re.sub(r"```(?:sql)?", "", s, flags=re.IGNORECASE)
@@ -48,6 +61,7 @@ def _canon_sql(s: str) -> str:
     if s.endswith(";"):
         s = s[:-1]
     return re.sub(r"\s+", " ", s).strip().lower()
+
 
 # -------- Static rules --------
 def static_rules(sql: str):
@@ -65,7 +79,9 @@ def static_rules(sql: str):
         guidance_lines.append("-- Consider full-text index (CONTAINS) or trigram search.")
         risks.append("Full scans on large tables can be expensive.")
 
-    if re.search(r"WHERE\s+.*\b(YEAR|MONTH|DAY|DATE|DATEADD|DATEDIFF|SUBSTRING|CAST|CONVERT)\s*\(", sql_compact):
+    if re.search(r"WHERE\s+.*\b(YEAR|MONTH|DAY|DATE|DATEADD|DATEDIFF|SUBSTRING|CAST|CONVERT)\s*\(", sql_compact) or re.search(
+        r"::\s*DATE\b", sql_norm, flags=re.IGNORECASE
+    ):
         findings.append("Non-sargable predicate (function/cast on column) can block index seeks.")
         guidance_lines.append("-- Prefer sargable range predicates over functions/casts on columns.")
 
@@ -78,20 +94,45 @@ def static_rules(sql: str):
     if "WHERE" not in sql_compact and "JOIN" in sql_compact:
         findings.append("JOIN without WHERE may explode rows; verify join predicates and filters.")
 
+    # YEAR(col)=YYYY -> range
     working = sql_norm
-    for m in re.finditer(r"\bYEAR\s*\(\s*(?P<col>[A-Za-z0-9_\.\[\]]+)\s*\)\s*=\s*(?P<yyyy>19\d{2}|20\d{2})", working, flags=re.IGNORECASE):
+    concrete_changes = 0
+    for m in re.finditer(
+        r"\bYEAR\s*\(\s*(?P<col>[A-Za-z0-9_\.\[\]]+)\s*\)\s*=\s*(?P<yyyy>19\d{2}|20\d{2})", working, flags=re.IGNORECASE
+    ):
         col, yyyy = m.group("col"), int(m.group("yyyy"))
         start, end = f"{yyyy:04d}-01-01", f"{(yyyy+1):04d}-01-01"
         rng = f"{col} >= '{start}' AND {col} < '{end}'"
-        working = re.sub(r"\bYEAR\s*\(\s*"+re.escape(col)+r"\s*\)\s*=\s*"+str(yyyy), rng, working, count=1, flags=re.IGNORECASE)
+        working = re.sub(
+            r"\bYEAR\s*\(\s*" + re.escape(col) + r"\s*\)\s*=\s*" + str(yyyy), rng, working, count=1, flags=re.IGNORECASE
+        )
+        concrete_changes += 1
 
-    rewrite_out = working if working != sql_norm else ("\n".join(guidance_lines) if guidance_lines else None)
+    rewrite_out = working if concrete_changes > 0 else ("\n".join(guidance_lines) if guidance_lines else None)
     return findings, rewrite_out, index_recs, None, risks
+
 
 # -------- Health --------
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# -------- OpenAI diag --------
+@app.get("/diag/openai")
+def diag_openai():
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY is not set.")
+    try:
+        import httpx
+        from openai import OpenAI
+
+        client = OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client(trust_env=False, timeout=10.0))
+        _ = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": "ping"}], max_tokens=1)
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"OpenAI check failed: {e}")
+
 
 # -------- Analyze --------
 @app.post("/analyze", response_model=AnalyzeResponse)
@@ -103,13 +144,14 @@ def analyze(req: AnalyzeRequest):
         sql_fmt = sql
 
     base_findings, base_rewrite, base_indexes, base_script, base_risks = static_rules(sql_fmt)
+    version_label = req.version or "latest"
 
-    # --- No OpenAI key fallback ---
+    # Static-only fallback
     if not OPENAI_API_KEY:
         if REQUIRE_OPENAI:
             raise HTTPException(status_code=503, detail="OpenAI_API_KEY missing.")
         return AnalyzeResponse(
-            summary="Static analysis completed (OpenAI not configured).",
+            summary=f"Static analysis completed for SQL Server {version_label} (OpenAI not configured).",
             findings=base_findings or ["No obvious issues detected."],
             rewrite_sql=base_rewrite or "No query rewrite suggestions were identified.",
             index_recommendations=base_indexes,
@@ -123,7 +165,6 @@ def analyze(req: AnalyzeRequest):
             ],
         )
 
-    # --- OpenAI call ---
     try:
         import httpx
         from openai import OpenAI
@@ -131,13 +172,10 @@ def analyze(req: AnalyzeRequest):
         http_client = httpx.Client(trust_env=False, timeout=30.0)
         client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
 
-        # 🧠 Version-aware system message
-        version_label = req.version or "latest"
         system_msg = (
             f"You are a veteran {req.dbms} performance engineer specializing in SQL Server {version_label}. "
-            f"Only suggest features and syntax compatible with SQL Server {version_label}. "
-            "If a feature was introduced after that version, explain the alternative. "
-            "Return safe, actionable tuning advice using only supported syntax. "
+            f"Only suggest features compatible with SQL Server {version_label}. "
+            "If a feature was introduced after that version, provide a compatible alternative. "
             "Use <YourTable> placeholders; never invent schema names."
         )
 
@@ -150,8 +188,7 @@ def analyze(req: AnalyzeRequest):
 
         json_instructions = (
             "Return a JSON object with keys: summary, findings, rewrite_sql, "
-            "index_recommendations, risks, and test_steps. "
-            "Always include all keys even if empty."
+            "index_recommendations, risks, and test_steps. Always include all keys even if empty."
         )
 
         resp = client.chat.completions.create(
@@ -167,45 +204,39 @@ def analyze(req: AnalyzeRequest):
 
         llm = json.loads(resp.choices[0].message.content)
 
-        # 🧩 Merge nested JSON if returned in summary
-        if isinstance(llm.get("summary"), str) and llm["summary"].strip().startswith("```json"):
-            try:
-                inner_json = re.search(r"\{.*\}", llm["summary"], re.DOTALL)
-                if inner_json:
-                    nested = json.loads(inner_json.group(0))
-                    for k, v in nested.items():
-                        if k not in llm or not llm[k]:
-                            llm[k] = v
-            except Exception as e:
-                print("⚠️ Nested JSON parse failed:", e)
+        # 🧹 Clean up markdown fences (```sql, ```json, ```text, etc.) across all text fields
+        def clean_markdown_fences(text: Optional[str]) -> Optional[str]:
+            if not text:
+                return text
+            cleaned = re.sub(r"```(?:sql|json|text)?", "", text, flags=re.IGNORECASE)
+            cleaned = cleaned.replace("```", "").replace("`", "").strip()
+            # Collapse multiple blank lines
+            cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+            return cleaned
 
-        defaults = {
-            "summary": f"LLM analysis completed for SQL Server {version_label}.",
-            "findings": [],
-            "rewrite_sql": "",
-            "index_recommendations": [],
-            "risks": [],
-            "test_steps": []
-        }
-        for k, v in defaults.items():
-            llm.setdefault(k, v)
+        # Clean textual fields
+        for key in ["summary", "rewrite_sql"]:
+            if key in llm and isinstance(llm[key], str):
+                llm[key] = clean_markdown_fences(llm[key])
 
-        def dedupe(seq): return list(dict.fromkeys(seq or []))
-       
-      # 🧹 Clean up markdown fences like ```sql, ```json, or ```
-rewrite_raw = llm.get("rewrite_sql") or ""
-rewrite_clean = re.sub(r"```(?:sql|json|text)?", "", rewrite_raw, flags=re.IGNORECASE)
-rewrite_clean = rewrite_clean.replace("```", "").strip()
+        # Clean list elements too
+        for key in ["findings", "index_recommendations", "risks", "test_steps"]:
+            if key in llm and isinstance(llm[key], list):
+                llm[key] = [clean_markdown_fences(x) for x in llm[key]]
 
-# Detect if rewritten SQL is identical to input
-same_as_input = _canon_sql(rewrite_clean) == _canon_sql(sql_fmt)
-rewrite_final = None if same_as_input else (rewrite_clean or None)
-if not rewrite_final:
-    rewrite_final = base_rewrite or "No query rewrite suggestions were identified."
+        # Detect if rewritten SQL equals input
+        rewrite_raw = llm.get("rewrite_sql") or ""
+        rewrite_clean = clean_markdown_fences(rewrite_raw)
+        same_as_input = _canon_sql(rewrite_clean) == _canon_sql(sql_fmt)
+        rewrite_final = None if same_as_input else (rewrite_clean or None)
+        if not rewrite_final:
+            rewrite_final = base_rewrite or "No query rewrite suggestions were identified."
 
+        def dedupe(seq): 
+            return list(dict.fromkeys(seq or []))
 
         return AnalyzeResponse(
-            summary=f"({req.dbms.upper()} {version_label}) - {llm.get('summary')}",
+            summary=llm.get("summary") or f"Analysis completed for {req.dbms} {version_label}.",
             findings=dedupe((base_findings or []) + (llm.get("findings") or [])),
             rewrite_sql=rewrite_final,
             index_recommendations=dedupe((base_indexes or []) + (llm.get("index_recommendations") or [])),
